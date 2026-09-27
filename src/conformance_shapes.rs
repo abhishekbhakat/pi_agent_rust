@@ -340,6 +340,8 @@ pub struct RegistrationSnapshot {
     pub models: Vec<Value>,
     #[serde(default)]
     pub message_renderers: Vec<Value>,
+    #[serde(default)]
+    pub entry_renderers: Vec<Value>,
 }
 
 impl RegistrationSnapshot {
@@ -2014,6 +2016,7 @@ mod tests {
                     flags: (0..n_flags).map(|_| null_val()).collect(),
                     models: (0..n_models).map(|_| null_val()).collect(),
                     message_renderers: (0..n_renderers).map(|_| null_val()).collect(),
+                    entry_renderers: Vec::new(),
                 };
                 assert_eq!(
                     snapshot.total_registrations(),

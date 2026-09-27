@@ -41,7 +41,7 @@ impl fmt::Debug for StreamRegistry {
 
 fn allocate_id(sequence: &AtomicU64) -> Result<String> {
     let previous = sequence
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
         .map_err(|_| {
             Error::extension("PI_NATIVE_STREAM_LIMIT: native stream identity space exhausted")
         })?;

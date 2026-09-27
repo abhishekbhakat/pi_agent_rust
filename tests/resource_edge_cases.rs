@@ -399,19 +399,19 @@ fn load_skills_with_defaults_includes_user_and_project_dirs() {
 // ─── Multiple unknown frontmatter fields ─────────────────────────────────────
 
 #[test]
-fn load_skills_reports_all_unknown_frontmatter_fields() {
-    let harness = TestHarness::new("load_skills_reports_all_unknown_frontmatter_fields");
+fn load_skills_ignores_unknown_frontmatter_fields() {
+    let harness = TestHarness::new("load_skills_ignores_unknown_frontmatter_fields");
 
     let cwd = harness.temp_path("project");
     std::fs::create_dir_all(&cwd).expect("create cwd");
     let agent_dir = harness.temp_path("agent");
     std::fs::create_dir_all(&agent_dir).expect("create agent dir");
 
-    let skill_dir = agent_dir.join("skills").join("multi_unknown");
+    let skill_dir = agent_dir.join("skills").join("multi-unknown");
     write_skill(
         &harness,
         &skill_dir,
-        "multi_unknown",
+        "multi-unknown",
         "A skill with unknowns",
         "field_a: 1\nfield_b: 2\n",
     );
@@ -424,19 +424,10 @@ fn load_skills_reports_all_unknown_frontmatter_fields() {
     });
 
     assert_eq!(result.skills.len(), 1);
-    // Should have diagnostics for unknown fields
+    // TS pi parity: unknown frontmatter fields are silently ignored.
     assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("field_a")),
-        "Expected warning for field_a"
-    );
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|d| d.message.contains("field_b")),
-        "Expected warning for field_b"
+        result.diagnostics.is_empty(),
+        "Expected no diagnostics, got: {:?}",
+        result.diagnostics
     );
 }

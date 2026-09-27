@@ -384,9 +384,85 @@ impl Theme {
     /// Load a theme from a JSON file.
     pub fn load(path: &Path) -> Result<Self> {
         let content = read_theme_file_bounded(path)?;
-        let theme: Self = serde_json::from_str(&content)?;
+        let value: serde_json::Value = serde_json::from_str(&content)?;
+        let theme: Self = if is_legacy_theme_json(&value) {
+            Self::from_legacy_json(&value)
+        } else {
+            serde_json::from_value(value)?
+        };
         theme.validate()?;
         Ok(theme)
+    }
+
+    /// Convert a TypeScript pi theme (`vars` + flat `colors` roles, see
+    /// pi-mono `theme-schema.json`) into this theme model.
+    ///
+    /// Role values may be hex strings, `vars` references, or xterm-256
+    /// indexes. Empty strings (terminal default) and roles with no
+    /// counterpart fall back to [`Theme::dark`]. TypeScript themes carry no
+    /// background role, so `vars.bg`/`vars.background` is used when present.
+    fn from_legacy_json(value: &serde_json::Value) -> Self {
+        let name = value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let empty = serde_json::Map::new();
+        let vars = value
+            .get("vars")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or(&empty);
+        let colors = value
+            .get("colors")
+            .and_then(serde_json::Value::as_object)
+            .unwrap_or(&empty);
+        let role = |keys: &[&str], fallback: &str| -> String {
+            keys.iter()
+                .find_map(|key| {
+                    colors
+                        .get(*key)
+                        .and_then(|color| resolve_legacy_color(color, vars, 0))
+                })
+                .unwrap_or_else(|| fallback.to_string())
+        };
+        let var = |keys: &[&str], fallback: &str| -> String {
+            keys.iter()
+                .find_map(|key| {
+                    vars.get(*key)
+                        .and_then(|color| resolve_legacy_color(color, vars, 0))
+                })
+                .unwrap_or_else(|| fallback.to_string())
+        };
+        let base = Self::dark();
+        Self {
+            name,
+            version: value
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("1.0")
+                .to_string(),
+            colors: ThemeColors {
+                foreground: role(&["text", "userMessageText"], &base.colors.foreground),
+                background: var(&["bg", "background"], &base.colors.background),
+                accent: role(&["accent"], &base.colors.accent),
+                success: role(&["success"], &base.colors.success),
+                warning: role(&["warning"], &base.colors.warning),
+                error: role(&["error"], &base.colors.error),
+                muted: role(&["muted", "dim"], &base.colors.muted),
+            },
+            syntax: SyntaxColors {
+                keyword: role(&["syntaxKeyword"], &base.syntax.keyword),
+                string: role(&["syntaxString"], &base.syntax.string),
+                number: role(&["syntaxNumber"], &base.syntax.number),
+                comment: role(&["syntaxComment"], &base.syntax.comment),
+                function: role(&["syntaxFunction"], &base.syntax.function),
+            },
+            ui: UiColors {
+                border: role(&["border", "borderMuted"], &base.ui.border),
+                selection: role(&["selectedBg"], &base.ui.selection),
+                cursor: role(&["borderAccent", "accent"], &base.ui.cursor),
+            },
+        }
     }
 
     /// Load a theme by name, searching global and project theme directories.
@@ -593,6 +669,80 @@ impl Theme {
     }
 }
 
+/// Whether a theme file uses the TypeScript pi schema (`vars` and/or flat
+/// `colors.text` roles) rather than this crate's nested schema.
+fn is_legacy_theme_json(value: &serde_json::Value) -> bool {
+    if value.get("vars").is_some_and(serde_json::Value::is_object) {
+        return true;
+    }
+    value
+        .get("colors")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|colors| colors.contains_key("text") && !colors.contains_key("foreground"))
+}
+
+/// Resolve a TypeScript theme color (hex, `vars` reference, or xterm-256
+/// index) to `#rrggbb`. Empty strings and unknown values yield `None`.
+fn resolve_legacy_color(
+    value: &serde_json::Value,
+    vars: &serde_json::Map<String, serde_json::Value>,
+    depth: u8,
+) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if text.starts_with('#') {
+                parse_hex_color(text).map(|(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}"))
+            } else if depth < 8 {
+                vars.get(text)
+                    .and_then(|next| resolve_legacy_color(next, vars, depth + 1))
+            } else {
+                None
+            }
+        }
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .and_then(|index| u8::try_from(index).ok())
+            .map(xterm256_to_hex),
+        _ => None,
+    }
+}
+
+/// Standard xterm-256 palette entry as `#rrggbb`.
+fn xterm256_to_hex(index: u8) -> String {
+    const BASE: [(u8, u8, u8); 16] = [
+        (0x00, 0x00, 0x00),
+        (0x80, 0x00, 0x00),
+        (0x00, 0x80, 0x00),
+        (0x80, 0x80, 0x00),
+        (0x00, 0x00, 0x80),
+        (0x80, 0x00, 0x80),
+        (0x00, 0x80, 0x80),
+        (0xc0, 0xc0, 0xc0),
+        (0x80, 0x80, 0x80),
+        (0xff, 0x00, 0x00),
+        (0x00, 0xff, 0x00),
+        (0xff, 0xff, 0x00),
+        (0x00, 0x00, 0xff),
+        (0xff, 0x00, 0xff),
+        (0x00, 0xff, 0xff),
+        (0xff, 0xff, 0xff),
+    ];
+    let (r, g, b) = match index {
+        0..=15 => BASE[usize::from(index)],
+        16..=231 => {
+            let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            let i = index - 16;
+            (level(i / 36), level((i / 6) % 6), level(i % 6))
+        }
+        232..=255 => {
+            let gray = 8 + (index - 232) * 10;
+            (gray, gray, gray)
+        }
+    };
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
 fn glob_json(dir: &Path) -> Vec<PathBuf> {
     if !dir.exists() {
         return Vec::new();
@@ -786,6 +936,49 @@ mod tests {
         };
         let themes = Theme::discover_themes_with_roots(&roots);
         assert_eq!(themes.len(), 2);
+    }
+
+    #[test]
+    fn loads_typescript_pi_theme_format() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mocha.json");
+        let json = serde_json::json!({
+            "$schema": "https://raw.githubusercontent.com/badlogic/pi-mono/main/packages/coding-agent/src/modes/interactive/theme/theme-schema.json",
+            "name": "mocha",
+            "vars": { "bg": "#1e1e2e", "fg": "#cdd6f4", "mauve": "#cba6f7", "alias": "mauve" },
+            "colors": {
+                "accent": "alias",
+                "text": "fg",
+                "error": "#F38BA8",
+                "borderMuted": 236,
+                "border": "",
+                "syntaxKeyword": "mauve"
+            }
+        });
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let theme = Theme::load(&path).expect("TypeScript pi theme loads");
+        let dark = Theme::dark();
+        assert_eq!(theme.name, "mocha");
+        assert_eq!(theme.version, "1.0");
+        assert_eq!(theme.colors.foreground, "#cdd6f4");
+        assert_eq!(theme.colors.background, "#1e1e2e");
+        assert_eq!(theme.colors.accent, "#cba6f7", "var chains resolve");
+        assert_eq!(theme.colors.error, "#f38ba8");
+        assert_eq!(theme.ui.border, "#303030", "empty role falls through");
+        assert_eq!(theme.syntax.keyword, "#cba6f7");
+        assert_eq!(theme.colors.success, dark.colors.success);
+        assert!(!theme.is_light());
+    }
+
+    #[test]
+    fn xterm256_palette_matches_standard_values() {
+        assert_eq!(xterm256_to_hex(1), "#800000");
+        assert_eq!(xterm256_to_hex(16), "#000000");
+        assert_eq!(xterm256_to_hex(196), "#ff0000");
+        assert_eq!(xterm256_to_hex(231), "#ffffff");
+        assert_eq!(xterm256_to_hex(236), "#303030");
+        assert_eq!(xterm256_to_hex(255), "#eeeeee");
     }
 
     #[test]

@@ -72,6 +72,11 @@ macro_rules! compressed_js_literal {
     }};
 }
 
+/// Unmodified third-party ESM builds served as PiJS virtual modules; see
+/// `src/pijs_vendor/README.md` for versions and licenses.
+const MARKED_JS: &str = include_str!("pijs_vendor/marked.esm.js");
+const SHLEX_JS: &str = include_str!("pijs_vendor/shlex.js");
+
 // ============================================================================
 // Environment variable filtering (bd-1av0.9)
 // ============================================================================
@@ -5211,6 +5216,27 @@ fn path_is_in_owned_extension_root(
     module_state: &Rc<RefCell<PiJsModuleState>>,
 ) -> bool {
     let state = module_state.borrow();
+
+    // An independent-extensions base directory (`~/.pi/agent/extensions/`,
+    // `.pi/extensions/`) registered for the active extension grants access
+    // to the whole extensions tree: upstream pi resolves sibling and
+    // cross-extension relative imports (e.g. `../shared/util.ts` or
+    // `./other-extension/mod.ts`) without a per-extension boundary there.
+    // Deeper per-extension roots inside the tree do not restrict this.
+    if extension_id.is_some_and(|extension_id| {
+        state
+            .extension_roots_by_id
+            .get(extension_id)
+            .is_some_and(|roots| {
+                roots.iter().any(|root| {
+                    path.starts_with(root)
+                        && crate::extensions::is_independent_extensions_root(root)
+                })
+            })
+    }) {
+        return true;
+    }
+
     let mut deepest_depth = None;
     let mut deepest_roots = Vec::new();
 
@@ -5314,7 +5340,85 @@ fn path_is_allowed_extension_fs_path(
     if path_is_in_registered_extension_root(path, module_state) {
         return in_owned_root;
     }
-    path.starts_with(workspace_root) || in_owned_root
+    path.starts_with(workspace_root)
+        || in_owned_root
+        || path_is_in_extension_pi_home_data_dir(path, extension_id, module_state)
+}
+
+/// Reserved first-level segments under the pi home (`~/.pi`). These belong to
+/// the host agent itself and stay deny-by-default for extension fs access.
+const PI_HOME_RESERVED_SEGMENTS: &[&str] = &[
+    "agent",
+    "bin",
+    "sessions",
+    "node_modules",
+    "extensions",
+    "skills",
+    "themes",
+    "prompts",
+    "cache",
+    "plugins",
+    "auth.json",
+];
+
+/// Narrow TS-parity allowance (gh #167): an extension may read and write its
+/// own namespaced data directory under the pi home, `~/.pi/<package-name>`
+/// (plus the `pi-`-prefix-stripped variant). Ecosystem extensions such as
+/// pi-grok-cli keep their account vault at `~/.pi/grok-cli`, which upstream
+/// TS pi permits because it has no extension fs sandbox. The directory name
+/// must match the basename of one of the active extension's registered
+/// roots, so an extension can never reach a peer extension's data or the
+/// host's own `~/.pi/agent` config tree.
+fn path_is_in_extension_pi_home_data_dir(
+    path: &Path,
+    extension_id: Option<&str>,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+) -> bool {
+    let Some(pi_home) = crate::config::Config::global_dir().parent().map(Path::to_path_buf)
+    else {
+        return false;
+    };
+    let checked = crate::extensions::safe_canonicalize(path);
+    let Ok(rel) = checked.strip_prefix(&pi_home) else {
+        return false;
+    };
+    let mut components = rel.components();
+    let Some(first) = components.next() else {
+        return false;
+    };
+    let Some(segment) = first.as_os_str().to_str() else {
+        return false;
+    };
+    let segment = segment.trim();
+    if segment.is_empty()
+        || PI_HOME_RESERVED_SEGMENTS.contains(&segment)
+        || segment.starts_with('.')
+        || segment.contains('/')
+        || segment.contains('\\')
+    {
+        return false;
+    }
+
+    let state = module_state.borrow();
+    let roots = extension_id
+        .and_then(|id| state.extension_roots_by_id.get(id))
+        .map(|roots| roots.as_slice())
+        .unwrap_or(&state.canonical_extension_roots);
+    roots.iter().any(|root| {
+        let Some(name) = root.file_name().and_then(std::ffi::OsStr::to_str) else {
+            return false;
+        };
+        let name = name.trim();
+        if name.is_empty() || PI_HOME_RESERVED_SEGMENTS.contains(&name) {
+            return false;
+        }
+        if name == segment {
+            return true;
+        }
+        name.strip_prefix("pi-").is_some_and(|stripped| {
+            !stripped.is_empty() && !PI_HOME_RESERVED_SEGMENTS.contains(&stripped) && stripped == segment
+        })
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -5351,6 +5455,7 @@ fn canonical_node_builtin(spec: &str) -> Option<&'static str> {
         "querystring" | "node:querystring" => Some("node:querystring"),
         "process" | "node:process" => Some("node:process"),
         "stream/promises" | "node:stream/promises" => Some("node:stream/promises"),
+        "stream/consumers" | "node:stream/consumers" => Some("node:stream/consumers"),
         "constants" | "node:constants" => Some("node:constants"),
         "tls" | "node:tls" => Some("node:tls"),
         "tty" | "node:tty" => Some("node:tty"),
@@ -8202,6 +8307,8 @@ export default Compile;
     modules.insert(
         "@mariozechner/pi-ai".to_string(),
         compressed_js_literal!(r#"
+export { Type } from "@sinclair/typebox";
+
 export function StringEnum(values, opts = {}) {
   const list = Array.isArray(values) ? values.map((v) => String(v)) : [];
   return { type: "string", enum: list, ...opts };
@@ -8511,6 +8618,53 @@ export function createAssistantMessageEventStream() {
   };
 }
 
+// lazyStream (upstream api/lazy.js): return a stream synchronously while
+// running async setup (auth resolution, lazy loading) behind it. Setup
+// failures terminate the stream with an error event.
+function __piLazySetupErrorMessage(model, error) {
+  return {
+    role: "assistant",
+    content: [],
+    api: model && model.api,
+    provider: model && model.provider,
+    model: model && model.id,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "error",
+    errorMessage: error instanceof Error ? error.message : String(error),
+    timestamp: Date.now(),
+  };
+}
+
+function __piLazyHasResult(source) {
+  return typeof source.result === "function";
+}
+
+async function __piLazyForwardStream(target, source) {
+  for await (const event of source) {
+    target.push(event);
+  }
+  target.end(__piLazyHasResult(source) ? await source.result() : undefined);
+}
+
+export function lazyStream(model, setup) {
+  const outer = createAssistantMessageEventStream();
+  setup()
+    .then((inner) => __piLazyForwardStream(outer, inner))
+    .catch((error) => {
+      const message = __piLazySetupErrorMessage(model, error);
+      outer.push({ type: "error", reason: "error", error: message });
+      outer.end(message);
+    });
+  return outer;
+}
+
 function assistantMessageFor(model, text, result) {
   const modelObj = model && typeof model === "object" ? model : {};
   const resultObj = result && typeof result === "object" ? result : {};
@@ -8552,18 +8706,35 @@ function providerBridgeStream(name, model, context, opts = {}, simple = true) {
         simple,
       });
       const text = completionText(result);
-      if (text) {
-        stream.push({ type: "text_delta", delta: text });
-      }
       const message =
         result && typeof result === "object" && result.message && typeof result.message === "object"
           ? result.message
           : assistantMessageFor(model, text, result);
-      stream.push({ type: "done", message });
+      if (!message.content || !Array.isArray(message.content)) {
+        message.content = text ? [{ type: "text", text }] : [];
+      }
+      // Structured AssistantMessageEvent protocol (mirrors the host's
+      // extension stream decoder): start, optional text block events, then
+      // a terminal done/error event whose reason matches the message.
+      stream.push({ type: "start", partial: message });
+      if (text) {
+        stream.push({ type: "text_start", contentIndex: 0, partial: message });
+        stream.push({ type: "text_delta", contentIndex: 0, delta: text, partial: message });
+        stream.push({ type: "text_end", contentIndex: 0, content: text, partial: message });
+      }
+      const stop = String(message.stopReason || "stop");
+      if (stop === "error" || stop === "aborted" || message.errorMessage) {
+        message.stopReason = stop === "aborted" ? "aborted" : "error";
+        stream.push({ type: "error", reason: message.stopReason, error: message });
+      } else {
+        message.stopReason = stop;
+        stream.push({ type: "done", reason: stop, message });
+      }
     } catch (error) {
       const message = assistantMessageFor(model, "", {});
       message.stopReason = "error";
       message.errorMessage = String((error && error.message) || error || "");
+      stream.push({ type: "start", partial: message });
       stream.push({ type: "error", reason: "error", error: message });
     }
   })();
@@ -8696,27 +8867,21 @@ Object.defineProperty(globalThis, "__pi_api_provider_registry_size", {
   enumerable: false,
 });
 
-async function* streamSimpleBridge(name, model, context, opts = {}) {
-  const result = await callProviderBridge(name, "completeAi", {
-    model,
-    context,
-    options: opts || {},
-    simple: true,
-  });
-  const text = completionText(result);
-  if (text) yield text;
-}
-
+// TS pi-ai parity: streamSimple* return an AssistantMessageEventStream of
+// structured events (start/text_delta/done), never a raw text generator.
+// Consumers forward these events verbatim into their own event streams
+// (pi-grok-cli's lazyStream), and the host's extension stream decoder
+// rejects streams that mix raw text chunks with structured events.
 export function streamSimpleAnthropic(model, context, opts = {}) {
-  return streamSimpleBridge("streamSimpleAnthropic", model, context, opts);
+  return providerBridgeStream("streamSimpleAnthropic", model, context, opts || {}, true);
 }
 
 export function streamSimpleOpenAIResponses(model, context, opts = {}) {
-  return streamSimpleBridge("streamSimpleOpenAIResponses", model, context, opts);
+  return providerBridgeStream("streamSimpleOpenAIResponses", model, context, opts || {}, true);
 }
 
 export function streamSimpleOpenAICompletions(model, context, opts = {}) {
-  return streamSimpleBridge("streamSimpleOpenAICompletions", model, context, opts);
+  return providerBridgeStream("streamSimpleOpenAICompletions", model, context, opts || {}, true);
 }
 
 export function stream(model, context, opts = {}) {
@@ -8899,7 +9064,268 @@ export function isContextOverflow(message, contextWindow) {
   }
 }
 
-export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, createAssistantMessageEventStream, stream, streamSimple, streamSimpleAnthropic, streamSimpleOpenAIResponses, streamSimpleOpenAICompletions, complete, completeSimple, getProviders, getModel, getApiProvider, getApiProviders, registerApiProvider, unregisterApiProviders, getModels, loginOpenAICodex, refreshOpenAICodexToken, isContextOverflow };
+// ---- Transcript helpers (upstream pi-ai utils/text.js + utils/transcript.js) ----
+
+export function contentText(content, separator = "\n") {
+  if (typeof content === "string") return content;
+  return content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join(separator);
+}
+
+function getSystemMessageText(message) {
+  const parts = [contentText(message.content)];
+  for (const text of Object.values(message.sections ?? {})) {
+    if (text !== null) parts.push(text);
+  }
+  return parts.filter((part) => part.length > 0).join("\n\n");
+}
+
+function isSystemMessage(message) {
+  return message.role === "system";
+}
+
+function getInitialSystemMessage(messages) {
+  const first = messages[0];
+  return first && isSystemMessage(first) ? first : undefined;
+}
+
+export function withoutInitialSystemMessage(messages) {
+  return getInitialSystemMessage(messages) ? messages.slice(1) : messages;
+}
+
+export function getCurrentTools(messages) {
+  const tools = new Map();
+  for (const message of messages) {
+    if (!isSystemMessage(message)) continue;
+    for (const tool of message.toolsRemoved ?? []) tools.delete(tool.name);
+    for (const tool of message.toolsAdded ?? []) tools.set(tool.name, tool);
+  }
+  return [...tools.values()];
+}
+
+function getCurrentSystemMessage(messages) {
+  const content = [];
+  const sections = new Map();
+  let timestamp;
+  for (const message of messages) {
+    if (!isSystemMessage(message)) continue;
+    timestamp ??= message.timestamp;
+    const text = contentText(message.content);
+    if (text.length > 0) content.push(text);
+    for (const [name, value] of Object.entries(message.sections ?? {})) {
+      if (value === null) sections.delete(name);
+      else sections.set(name, value);
+    }
+  }
+  const tools = getCurrentTools(messages);
+  if (timestamp === undefined && tools.length === 0) return undefined;
+  return {
+    role: "system",
+    content: content.join("\n\n"),
+    ...(sections.size > 0 ? { sections: Object.fromEntries(sections) } : {}),
+    ...(tools.length > 0 ? { toolsAdded: tools } : {}),
+    timestamp: timestamp ?? 0,
+  };
+}
+
+export function getCurrentSystemPrompt(messages) {
+  const message = getCurrentSystemMessage(messages);
+  return message ? getSystemMessageText(message) : "";
+}
+
+export function collapseSystemMessages(context) {
+  const head = getCurrentSystemMessage(context.messages);
+  const messages = context.messages.filter((message) => message.role !== "system");
+  return { messages: head ? [head, ...messages] : messages };
+}
+
+// ---- UUIDv7 (upstream pi-ai utils/uuid.js) ----
+
+const __piMaxUuidV7Timestamp = 0xffffffffffff;
+const __piMaxSequence = (1n << 41n) - 1n;
+let __piLastOrdinaryTimestamp = -1;
+let __piSequence;
+
+function __piFillRandomBytes(bytes) {
+  if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === "function") {
+    globalThis.crypto.getRandomValues(bytes);
+    return;
+  }
+  for (let index = 0; index < bytes.length; index++) {
+    bytes[index] = Math.floor(Math.random() * 256);
+  }
+}
+
+export function uuidv7(timestampMs) {
+  const requestedTimestamp = timestampMs ?? Date.now();
+  if (!Number.isInteger(requestedTimestamp) || requestedTimestamp < 0 || requestedTimestamp > __piMaxUuidV7Timestamp) {
+    throw new RangeError(`UUIDv7 timestamp must be an integer between 0 and ${__piMaxUuidV7Timestamp}`);
+  }
+  const effectiveTimestamp = timestampMs === undefined ? Math.max(requestedTimestamp, __piLastOrdinaryTimestamp) : timestampMs;
+  if (timestampMs === undefined) __piLastOrdinaryTimestamp = effectiveTimestamp;
+  const bytes = new Uint8Array(16);
+  __piFillRandomBytes(bytes);
+  if (__piSequence === undefined) {
+    __piSequence =
+      (BigInt(bytes[1]) << 32n) |
+      (BigInt(bytes[2]) << 24n) |
+      (BigInt(bytes[3]) << 16n) |
+      (BigInt(bytes[4]) << 8n) |
+      BigInt(bytes[5]);
+  } else {
+    if (__piSequence === __piMaxSequence) throw new RangeError("UUIDv7 generator sequence exhausted");
+    __piSequence++;
+  }
+  const timestamp = BigInt(effectiveTimestamp);
+  for (let index = 5; index >= 0; index--) {
+    bytes[index] = Number(timestamp >> BigInt((5 - index) * 8)) & 0xff;
+  }
+  bytes[6] = 0x70 | Number((__piSequence >> 37n) & 0x0fn);
+  bytes[7] = Number((__piSequence >> 29n) & 0xffn);
+  bytes[8] = 0x80 | Number((__piSequence >> 23n) & 0x3fn);
+  bytes[9] = Number((__piSequence >> 15n) & 0xffn);
+  bytes[10] = Number((__piSequence >> 7n) & 0xffn);
+  bytes[11] = Number((__piSequence & 0x7fn) << 1n) | (bytes[11] & 0x01);
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"));
+  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
+}
+
+// ---- Retry helpers (upstream pi-ai utils/retry.js) ----
+
+const __piNonRetryableLimitPattern = new RegExp(
+  [
+    "GoUsageLimitError",
+    "FreeUsageLimitError",
+    "Monthly usage limit reached",
+    "available balance",
+    "insufficient_quota",
+    "out of budget",
+    "quota exceeded",
+    "billing",
+  ].join("|"),
+  "i",
+);
+
+const __piRetryableErrorPattern = new RegExp(
+  [
+    "overloaded",
+    "currently experiencing high demand",
+    "rate.?limit",
+    "too many requests",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "520",
+    "524",
+    "service.?unavailable",
+    "server.?error",
+    "internal.?error",
+    "provider.?returned.?error",
+    "exceeded request buffer limit while retrying upstream",
+    "network.?error",
+    "connection.?error",
+    "connection.?refused",
+    "connection.?lost",
+    "other side closed",
+    "fetch failed",
+    "getaddrinfo",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "upstream.?connect",
+    "reset before headers",
+    "socket hang up",
+    "socket connection was closed",
+    "timed? out",
+    "timeout",
+    "terminated",
+    "websocket.?closed",
+    "websocket.?error",
+    "ended without",
+    "stream ended before message_stop",
+    "stream ended before a terminal response event",
+    "http2 request did not get a response",
+    "retry delay",
+    "you can retry your request",
+    "try your request again",
+    "please retry your request",
+    "ResourceExhausted",
+  ].join("|"),
+  "i",
+);
+
+export const DEFAULT_MAX_AGENT_RETRY_DELAY_MS = 60000;
+
+export function retryDelayMs(policy, attempt) {
+  const delay = policy.baseDelayMs * 2 ** Math.max(0, attempt - 1);
+  const safeDelay = Number.isSafeInteger(delay) ? delay : Number.MAX_SAFE_INTEGER;
+  return Math.min(safeDelay, policy.maxAgentDelayMs ?? DEFAULT_MAX_AGENT_RETRY_DELAY_MS);
+}
+
+function __piRetrySleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      reject(new Error("Aborted"));
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    if (signal && typeof signal.addEventListener === "function") {
+      signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(new Error("Aborted"));
+      }, { once: true });
+    }
+  });
+}
+
+export function isRetryableAssistantError(message) {
+  if (message.stopReason !== "error" || !message.errorMessage) return false;
+  const errorMessage = message.errorMessage;
+  if (__piNonRetryableLimitPattern.test(errorMessage)) return false;
+  return __piRetryableErrorPattern.test(errorMessage);
+}
+
+export async function retryAssistantCall(produce, policy, signal, callbacks) {
+  const maxAttempts = policy && policy.enabled ? policy.maxRetries : 0;
+  let attempt = 0;
+  let lastRetry;
+  for (;;) {
+    const response = await produce();
+    if (response.stopReason === "aborted") {
+      if (lastRetry) await callbacks?.onRetryFinished?.(false, lastRetry.attempt);
+      return response;
+    }
+    if (response.stopReason !== "error") {
+      if (lastRetry) await callbacks?.onRetryFinished?.(true, lastRetry.attempt);
+      return response;
+    }
+    if (attempt >= maxAttempts || !isRetryableAssistantError(response)) {
+      if (lastRetry) await callbacks?.onRetryFinished?.(false, lastRetry.attempt, response.errorMessage);
+      return response;
+    }
+    attempt++;
+    lastRetry = { attempt, errorMessage: response.errorMessage || "Unknown error" };
+    const delayMs = retryDelayMs(policy, attempt);
+    await callbacks?.onRetryScheduled?.(attempt, maxAttempts, delayMs, lastRetry.errorMessage);
+    try {
+      await __piRetrySleep(delayMs, signal);
+    } catch (error) {
+      await callbacks?.onRetryFinished?.(false, attempt, lastRetry.errorMessage);
+      if (error && error.message === "Aborted") {
+        const rest = { ...response };
+        delete rest.errorMessage;
+        return { ...rest, stopReason: "aborted" };
+      }
+      throw error;
+    }
+    await callbacks?.onRetryAttemptStart?.();
+  }
+}
+
+export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, createAssistantMessageEventStream, lazyStream, stream, streamSimple, streamSimpleAnthropic, streamSimpleOpenAIResponses, streamSimpleOpenAICompletions, complete, completeSimple, getProviders, getModel, getApiProvider, getApiProviders, registerApiProvider, unregisterApiProviders, getModels, loginOpenAICodex, refreshOpenAICodexToken, isContextOverflow, contentText, withoutInitialSystemMessage, getCurrentTools, getCurrentSystemPrompt, collapseSystemMessages, uuidv7, retryDelayMs, isRetryableAssistantError, retryAssistantCall, DEFAULT_MAX_AGENT_RETRY_DELAY_MS };
 "#)
         .trim()
         .to_string(),
@@ -9237,6 +9663,8 @@ export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Te
     modules.insert(
         "@mariozechner/pi-coding-agent".to_string(),
         compressed_js_literal!(r#"
+import { readFileSync, writeFileSync } from "node:fs";
+
 export const VERSION = "0.0.0";
 
 export const DEFAULT_MAX_LINES = 2000;
@@ -9802,6 +10230,211 @@ export function getAgentDir() {
   return home ? `${home}/.pi/agent` : "/home/unknown/.pi/agent";
 }
 
+export function getPackageDir() {
+  const envValue =
+    globalThis.pi && globalThis.pi.env && typeof globalThis.pi.env.get === "function"
+      ? globalThis.pi.env.get("PI_PACKAGE_DIR")
+      : undefined;
+  if (envValue) return String(envValue);
+  return `${getAgentDir()}/packages`;
+}
+
+// Read a provider credential from ~/.pi/agent/auth.json
+// (upstream core/extensions/auth-storage.js readStoredCredential).
+export function readStoredCredential(providerId, _authPath) {
+  try {
+    const id = String(providerId || "");
+    if (!id) return undefined;
+    const native = globalThis.__pi_read_stored_credential_native;
+    if (typeof native !== "function") return undefined;
+    const raw = native(id);
+    return raw == null ? undefined : JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+// Convert an image to PNG for terminal display (upstream utils/image-convert.js
+// convertToPng). PNG passes through; other formats need the Photon WASM
+// converter, which is unavailable in this host — the TS implementation also
+// returns null when the converter is missing.
+export async function convertToPng(base64Data, mimeType) {
+  if (mimeType === "image/png") {
+    return { data: base64Data, mimeType };
+  }
+  return null;
+}
+
+function __piSettingsClone(value) {
+  if (value === undefined || value === null) return value;
+  return JSON.parse(JSON.stringify(value));
+}
+
+function __piSettingsReadJsonText(text) {
+  if (typeof text !== "string" || text === "") return {};
+  const stripped = text.replace(/^\uFEFF/, "");
+  try {
+    const parsed = JSON.parse(stripped);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+// SettingsManager (upstream core/settings-manager.js): loads global settings
+// from <agentDir>/settings.json and project settings from <cwd>/.pi/settings.json,
+// merged with project winning. Writes go through the fs sandbox like any other
+// extension write; failures are recorded and surfaced via drainErrors().
+export class SettingsManager {
+  constructor(cwd, agentDir) {
+    this.cwd = String(cwd || ".");
+    this.agentDir = String(agentDir || getAgentDir());
+    this.errors = [];
+    this.globalSettings = this.#loadGlobal();
+    this.projectSettings = this.#loadProject();
+    this.settings = { ...this.globalSettings, ...this.projectSettings };
+  }
+
+  #loadGlobal() {
+    if (this.agentDir === getAgentDir()) {
+      const native = globalThis.__pi_read_global_settings_text_native;
+      if (typeof native === "function") {
+        return __piSettingsReadJsonText(native());
+      }
+    }
+    try {
+      return __piSettingsReadJsonText(readFileSync(`${this.agentDir}/settings.json`, "utf-8"));
+    } catch {
+      return {};
+    }
+  }
+
+  #loadProject() {
+    try {
+      return __piSettingsReadJsonText(readFileSync(`${this.cwd}/.pi/settings.json`, "utf-8"));
+    } catch {
+      return {};
+    }
+  }
+
+  static create(cwd, agentDir) {
+    return new SettingsManager(cwd, agentDir === undefined ? getAgentDir() : agentDir);
+  }
+
+  getGlobalSettings() {
+    return __piSettingsClone(this.globalSettings);
+  }
+
+  getProjectSettings() {
+    return __piSettingsClone(this.projectSettings);
+  }
+
+  #record(field) {
+    this.globalSettings[field] = this.settings[field];
+  }
+
+  #save() {
+    try {
+      writeFileSync(`${this.agentDir}/settings.json`, JSON.stringify(this.globalSettings, null, "\t") + "\n", "utf-8");
+    } catch (error) {
+      this.errors.push({ path: `${this.agentDir}/settings.json`, error });
+    }
+  }
+
+  async flush() {
+    return undefined;
+  }
+
+  drainErrors() {
+    const drained = this.errors;
+    this.errors = [];
+    return drained;
+  }
+
+  getDefaultProvider() {
+    return this.settings.defaultProvider;
+  }
+
+  setDefaultProvider(provider) {
+    this.globalSettings.defaultProvider = provider;
+    this.settings.defaultProvider = provider;
+    this.#save();
+  }
+
+  getDefaultModel() {
+    return this.settings.defaultModel;
+  }
+
+  setDefaultModel(modelId) {
+    this.globalSettings.defaultModel = modelId;
+    this.settings.defaultModel = modelId;
+    this.#save();
+  }
+
+  getEnabledModels() {
+    return this.settings.enabledModels;
+  }
+
+  setEnabledModels(patterns) {
+    this.globalSettings.enabledModels = patterns;
+    this.settings.enabledModels = patterns;
+    this.#save();
+  }
+
+  getThemeSetting() {
+    const value = this.settings.theme;
+    return typeof value === "string" ? value : undefined;
+  }
+
+  getTheme() {
+    const theme = this.getThemeSetting();
+    return theme && theme.includes("/") ? undefined : theme;
+  }
+
+  setTheme(theme) {
+    this.globalSettings.theme = theme;
+    this.settings.theme = theme;
+    this.#save();
+  }
+}
+
+function __piEscapeXml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+// Format skills for inclusion in a system prompt (upstream core/skills.js).
+// Skills with disableModelInvocation=true are excluded from the prompt.
+export function formatSkillsForPrompt(skills, fileReadTool = "read") {
+  const list = Array.isArray(skills) ? skills : [];
+  const visibleSkills = list.filter((s) => !s.disableModelInvocation);
+  if (visibleSkills.length === 0) {
+    return "";
+  }
+  const lines = [
+    "\n\nThe following skills provide specialized instructions for specific tasks.",
+    fileReadTool === "read"
+      ? "Use the read tool to load a skill's file when the task matches its description."
+      : "Use bash to load a skill's file when the task matches its description.",
+    "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+    "",
+    "<available_skills>",
+  ];
+  for (const skill of visibleSkills) {
+    lines.push("  <skill>");
+    lines.push(`    <name>${__piEscapeXml(skill.name)}</name>`);
+    lines.push(`    <description>${__piEscapeXml(skill.description)}</description>`);
+    lines.push(`    <location>${__piEscapeXml(skill.filePath)}</location>`);
+    lines.push("  </skill>");
+  }
+  lines.push("</available_skills>");
+  return lines.join("\n");
+}
+
 // Canonical upstream action IDs used by extension-facing key hints. Keep the
 // values in upstream's display form so package UI text matches TypeScript Pi.
 const __piKeyText = {
@@ -9960,15 +10593,6 @@ export class SessionManager {
   }
   buildSessionContext() { return buildSessionContext([]); }
 }
-
-export class SettingsManager {
-  constructor(cwd = "", agentDir = "") {
-    this.cwd = String(cwd ?? "");
-    this.agentDir = String(agentDir ?? "");
-  }
-  static create(cwd, agentDir) { return new SettingsManager(cwd, agentDir); }
-}
-
 export class DefaultResourceLoader {
   constructor(opts = {}) {
     this.opts = opts;
@@ -10111,6 +10735,10 @@ export default {
   createEditTool,
   copyToClipboard,
   getAgentDir,
+  getPackageDir,
+  formatSkillsForPrompt,
+  readStoredCredential,
+  convertToPng,
   keyText,
   keyHint,
   rawKeyHint,
@@ -10409,6 +11037,10 @@ export default { sign, verify, decode };
         .trim()
         .to_string(),
     );
+
+    // ── marked / shlex (vendored, see src/pijs_vendor/README.md) ─────
+    modules.insert("marked".to_string(), compressed_js_literal!(MARKED_JS));
+    modules.insert("shlex".to_string(), compressed_js_literal!(SHLEX_JS));
 
     // ── shell-quote ──────────────────────────────────────────────────
     modules.insert(
@@ -11654,6 +12286,7 @@ import * as net from "node:net";
 import * as events from "node:events";
 import * as stream from "node:stream";
 import * as streamPromises from "node:stream/promises";
+import * as streamConsumers from "node:stream/consumers";
 import * as streamWeb from "node:stream/web";
 import * as stringDecoder from "node:string_decoder";
 import * as http2 from "node:http2";
@@ -11727,6 +12360,9 @@ function __normalizeBuiltin(id) {
     case "stream/promises":
     case "node:stream/promises":
       return "node:stream/promises";
+    case "stream/consumers":
+    case "node:stream/consumers":
+      return "node:stream/consumers";
     case "string_decoder":
     case "node:string_decoder":
       return "node:string_decoder";
@@ -11804,6 +12440,7 @@ const __builtinModules = {
   "node:stream": stream,
   "node:stream/web": streamWeb,
   "node:stream/promises": streamPromises,
+  "node:stream/consumers": streamConsumers,
   "node:string_decoder": stringDecoder,
   "node:http2": http2,
   "node:util": util,
@@ -12707,6 +13344,18 @@ export function existsSync(path) {
 }
 
 export function readFileSync(path, encoding) {
+  // Node parity: readFileSync(fd) reads from the descriptor's current
+  // position to end-of-file.
+  if (typeof path === "number") {
+    const entry = __pi_vfs.getFdEntry(path);
+    if (!entry.readable) {
+      throw new Error(`EBADF: bad file descriptor, fd ${String(path)}`);
+    }
+    __pi_vfs.authorizeFdRead(entry);
+    const bytes = __pi_vfs.files.get(entry.path) || new Uint8Array();
+    const start = Math.min(entry.position, bytes.byteLength);
+    return __pi_vfs.decodeBytes(bytes.subarray(start), encoding);
+  }
   const resolved = __pi_vfs.resolvePathForRead(path, true);
   let bytes = __pi_vfs.files.get(resolved);
   let hostError = "";
@@ -12737,6 +13386,13 @@ export function appendFileSync(path, data, opts) {
 }
 
 export function writeFileSync(path, data, opts) {
+  // Node parity: writeFileSync(fd, data) writes at the descriptor's current
+  // position. Extensions such as pi-grok-cli write lock files through the
+  // descriptor returned by openSync(path, 'wx').
+  if (typeof path === "number") {
+    writeSync(path, data);
+    return;
+  }
   const resolved = __pi_vfs.resolvePathForWrite(path, true);
   if (
     __pi_vfs.dirs.has(resolved) ||
@@ -15262,6 +15918,92 @@ export default { Stream, Readable, Writable, Duplex, Transform, PassThrough, pip
         .to_string(),
     );
 
+    // node:stream/consumers — collect stream/blob payloads
+    modules.insert(
+        "node:stream/consumers".to_string(),
+        compressed_js_literal!(r#"
+function __consumersToBytes(chunk) {
+  if (typeof chunk === "string") return Buffer.from(chunk, "utf8");
+  if (Buffer.isBuffer(chunk)) return chunk;
+  if (chunk instanceof Uint8Array) return chunk;
+  if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+  if (ArrayBuffer.isView(chunk)) {
+    return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  }
+  return Buffer.from(String(chunk), "utf8");
+}
+
+async function __collectChunks(stream) {
+  if (!stream || (typeof stream !== "object" && typeof stream !== "function")) {
+    throw new TypeError("Expected a stream or blob");
+  }
+  if (typeof stream.arrayBuffer === "function" && typeof stream.pipe !== "function") {
+    return [new Uint8Array(await stream.arrayBuffer())];
+  }
+  if (typeof stream.getReader === "function") {
+    const reader = stream.getReader();
+    const chunks = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value !== undefined) chunks.push(value);
+    }
+    return chunks;
+  }
+  if (typeof stream[Symbol.asyncIterator] === "function") {
+    const chunks = [];
+    for await (const chunk of stream) {
+      if (chunk !== undefined && chunk !== null) chunks.push(chunk);
+    }
+    return chunks;
+  }
+  if (typeof stream.on === "function") {
+    return await new Promise((resolve, reject) => {
+      const chunks = [];
+      stream.on("data", (chunk) => {
+        if (chunk !== undefined && chunk !== null) chunks.push(chunk);
+      });
+      stream.on("end", () => resolve(chunks));
+      stream.on("error", reject);
+      if (typeof stream.resume === "function") stream.resume();
+    });
+  }
+  throw new TypeError("Expected a stream or blob");
+}
+
+async function buffer(stream) {
+  const chunks = await __collectChunks(stream);
+  return Buffer.concat(chunks.map(__consumersToBytes));
+}
+
+async function bytes(stream) {
+  return buffer(stream);
+}
+
+async function text(stream) {
+  return (await buffer(stream)).toString("utf8");
+}
+
+async function json(stream) {
+  return JSON.parse(await text(stream));
+}
+
+async function arrayBuffer(stream) {
+  const buf = await buffer(stream);
+  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+}
+
+async function blob(stream) {
+  return new Blob([await arrayBuffer(stream)]);
+}
+
+export { arrayBuffer, blob, buffer, bytes, json, text };
+export default { arrayBuffer, blob, buffer, bytes, json, text };
+"#)
+        .trim()
+        .to_string(),
+    );
+
     // node:stream/promises — promise-based stream utilities
     modules.insert(
         "node:stream/promises".to_string(),
@@ -17206,6 +17948,7 @@ struct JsRuntimeRegistrySnapshot {
     providers: u64,
     shortcuts: u64,
     message_renderers: u64,
+    entry_renderers: u64,
     mcp_servers: u64,
     pending_tasks: u64,
     pending_hostcalls: u64,
@@ -17560,6 +18303,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             + reset_payload.after.providers
             + reset_payload.after.shortcuts
             + reset_payload.after.message_renderers
+            + reset_payload.after.entry_renderers
             + reset_payload.after.mcp_servers
             + reset_payload.after.pending_tasks
             + reset_payload.after.pending_hostcalls
@@ -19109,6 +19853,48 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     ),
                 )?;
 
+                // __pi_read_stored_credential_native(provider_id) -> Option<JSON string>
+                // Read-only access to credentials in ~/.pi/agent/auth.json,
+                // mirroring readStoredCredential() from the TS coding agent
+                // (core/extensions/auth-storage.js). The fs sandbox blocks
+                // extension reads of the auth file, so the host bridges it.
+                global.set(
+                    "__pi_read_stored_credential_native",
+                    Func::from(
+                        move |_ctx: Ctx<'_>, provider_id: String| -> rquickjs::Result<Option<String>> {
+                            let auth_path = crate::config::Config::global_dir().join("auth.json");
+                            let Ok(mut raw) = std::fs::read_to_string(&auth_path) else {
+                                return Ok(None);
+                            };
+                            if raw.starts_with('\u{feff}') {
+                                raw = raw.trim_start_matches('\u{feff}').to_string();
+                            }
+                            let Ok(data) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                                return Ok(None);
+                            };
+                            Ok(data.get(provider_id).map(|v| v.to_string()))
+                        },
+                    ),
+                )?;
+
+                // __pi_read_global_settings_text_native() -> Option<JSON text>
+                // Read-only access to ~/.pi/agent/settings.json for the
+                // SettingsManager shim. The fs sandbox blocks extension reads
+                // of the agent dir, so the host bridges the global file.
+                global.set(
+                    "__pi_read_global_settings_text_native",
+                    Func::from(
+                        move |_ctx: Ctx<'_>| -> rquickjs::Result<Option<String>> {
+                            let settings_path =
+                                crate::config::Config::global_dir().join("settings.json");
+                            match std::fs::read_to_string(&settings_path) {
+                                Ok(raw) => Ok(Some(raw)),
+                                Err(_) => Ok(None),
+                            }
+                        },
+                    ),
+                )?;
+
                 // __pi_base64_encode_native(binary_string) -> base64 string
                 global.set(
                     "__pi_base64_encode_native",
@@ -20322,6 +21108,10 @@ if (typeof globalThis.console === 'undefined') {
     const __fmt = (...args) => args.map(a => {
         if (a === null) return 'null';
         if (a === undefined) return 'undefined';
+        if (a instanceof Error) {
+            const stack = a.stack ? `\n${a.stack}` : '';
+            return `${a.name}: ${a.message}${stack}`;
+        }
         if (typeof a === 'object') {
             try { return JSON.stringify(a); } catch (_) { return String(a); }
         }
@@ -20541,6 +21331,7 @@ const __pi_event_bus_index = new Map(); // event_name -> [{ extensionId, handler
 const __pi_provider_index = new Map();  // provider_id -> { extensionId, spec }
 const __pi_shortcut_index = new Map();  // key_id -> { extensionId, key, description, handler }
 const __pi_message_renderer_index = new Map(); // customType -> { extensionId, customType, renderer }
+const __pi_entry_renderer_index = new Map(); // customType -> { extensionId, customType, renderer }
 const __pi_mcp_server_index = new Map(); // server_name -> { extensionId, spec }
 
 // gh #167 extension-API parity: host session identity mirror + current system
@@ -20557,6 +21348,13 @@ Object.defineProperty(globalThis, '__pi_session_identity', {
     enumerable: false,
 });
 let __pi_current_system_prompt = null;
+
+// gh #167 parity: synchronous getAllTools() mirror. TS pi's
+// `pi.getAllTools()` returns ToolInfo[] synchronously (no hostcall), so the
+// host seeds builtin tool defs into the ctx payload (`allTools`) and the
+// mirror is refreshed on every ctx build. Extension-registered tools are
+// merged host-side before the payload reaches the bridge.
+const __pi_all_tools = [];
 
 // Async task tracking for Rust-driven calls (tool exec, command exec, event dispatch).
 // task_id -> { status: 'pending'|'resolved'|'rejected', value?, error? }
@@ -20645,6 +21443,7 @@ function __pi_runtime_registry_snapshot() {
         providers: __pi_map_size_primordial(__pi_provider_index),
         shortcuts: __pi_map_size_primordial(__pi_shortcut_index),
         messageRenderers: __pi_map_size_primordial(__pi_message_renderer_index),
+        entryRenderers: __pi_map_size_primordial(__pi_entry_renderer_index),
         mcpServers: __pi_map_size_primordial(__pi_mcp_server_index),
         pendingTasks: __pi_map_size_primordial(__pi_tasks),
         pendingHostcalls: __pi_map_size_primordial(__pi_pending_hostcalls),
@@ -20718,6 +21517,7 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
     __pi_map_clear_primordial(__pi_provider_index);
     __pi_map_clear_primordial(__pi_shortcut_index);
     __pi_map_clear_primordial(__pi_message_renderer_index);
+    __pi_map_clear_primordial(__pi_entry_renderer_index);
     __pi_map_clear_primordial(__pi_mcp_server_index);
     __pi_map_clear_primordial(__pi_tasks);
     __pi_map_clear_primordial(__pi_pending_hostcalls);
@@ -20739,6 +21539,7 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
         after.providers === 0 &&
         after.shortcuts === 0 &&
         after.messageRenderers === 0 &&
+        after.entryRenderers === 0 &&
         after.mcpServers === 0 &&
         after.pendingTasks === 0 &&
         after.pendingHostcalls === 0 &&
@@ -20782,6 +21583,7 @@ function __pi_get_or_create_extension(extension_id, meta) {
             flags: new Map(),
             flagValues: new Map(),
             messageRenderers: new Map(),
+            entryRenderers: new Map(),
             activeTools: null,
         });
     }
@@ -21392,6 +22194,25 @@ function __pi_register_message_renderer(customType, renderer) {
     __pi_message_renderer_index.set(typeId, record);
 }
 
+function __pi_register_entry_renderer(customType, renderer) {
+    const ext = __pi_current_extension_or_throw();
+    const typeId = String(customType || '').trim();
+    if (!typeId) {
+        throw new Error('registerEntryRenderer: customType is required');
+    }
+    if (typeof renderer !== 'function') {
+        throw new Error('registerEntryRenderer: renderer must be a function');
+    }
+
+    const record = {
+        customType: typeId,
+        renderer: renderer,
+        extensionId: ext.id,
+    };
+    ext.entryRenderers.set(typeId, record);
+    __pi_entry_renderer_index.set(typeId, record);
+}
+
 	function __pi_register_hook(event_name, handler) {
 	    const ext = __pi_current_extension_or_throw();
 	    const eventName = String(event_name || '').trim();
@@ -21538,8 +22359,16 @@ function __pi_set_active_tools(tools) {
 
 function __pi_get_active_tools() {
     const ext = __pi_current_extension_or_throw();
-    if (!Array.isArray(ext.activeTools)) return undefined;
+    // TS pi's getActiveTools() always returns a string[] (the agent's active
+    // tool names); never undefined.
+    if (!Array.isArray(ext.activeTools)) return [];
     return ext.activeTools.slice();
+}
+
+function __pi_get_all_tools() {
+    // TS pi's getAllTools() is synchronous (ToolInfo[]); serve the mirror
+    // refreshed from ctx payloads instead of a hostcall round-trip.
+    return __pi_all_tools.slice();
 }
 
 function __pi_get_model() {
@@ -21660,6 +22489,11 @@ function __pi_snapshot_extensions() {
             message_renderers.push(renderer.customType);
         }
 
+        const entry_renderers = [];
+        for (const renderer of ext.entryRenderers.values()) {
+            entry_renderers.push(renderer.customType);
+        }
+
         const flags = [];
         for (const [flagName, flagSpec] of ext.flags.entries()) {
             flags.push({
@@ -21681,6 +22515,7 @@ function __pi_snapshot_extensions() {
             mcp_servers: mcp_servers,
             shortcuts: shortcuts,
             message_renderers: message_renderers,
+            entry_renderers: entry_renderers,
             flags: flags,
             event_hooks: Array.from(event_hooks),
             active_tools: Array.isArray(ext.activeTools) ? ext.activeTools.slice() : null,
@@ -22134,10 +22969,27 @@ function __pi_make_extension_ctx(ctx_payload) {
     const modelCatalog =
         ctx_payload && Array.isArray(ctx_payload.models) ? ctx_payload.models : [];
 
+    // gh #167 parity: refresh the synchronous getAllTools() mirror. Only
+    // payloads that carry `allTools` update it, so minimal ctx objects
+    // (tool executions ship {cwd}) never clobber the last known set.
+    if (ctx_payload && Array.isArray(ctx_payload.allTools)) {
+        __pi_all_tools.length = 0;
+        for (const t of ctx_payload.allTools) __pi_all_tools.push(t);
+    }
+
     const sessionManager = {
         getEntries: () => entries,
         getBranch: () => branch,
         getLeafEntry: () => leafEntry,
+        getLeafId: () => (leafEntry && typeof leafEntry.id === 'string' ? leafEntry.id : null),
+        // TS SessionManager.getHeader(): the first entry of type 'session'.
+        // The Rust host keeps the header outside the entry list, so
+        // synthesize the upstream shape from the session identity; null when
+        // no session is attached (TS also yields null for headerless files).
+        getHeader: () =>
+            sessionId
+                ? { type: 'session', id: sessionId, cwd: cwd, parentSession: undefined }
+                : null,
         getSessionId: () => sessionId,
         getSessionFile: () => sessionFile,
         getSessionDir: () => sessionDir,
@@ -22309,11 +23161,34 @@ function __pi_project_model_entry(raw) {
 	        let currentSystemPrompt = typeof base.systemPrompt === 'string' ? base.systemPrompt : '';
 	        let modified = false;
 	        const messages = [];
+	        // gh #167: TS pi hands every handler the same mutable
+	        // NormalizedBuildSystemPromptOptions object; later handlers see
+	        // earlier mutations. Seed from the host payload and share one
+	        // object across handlers.
+	        const seedOptions = base.systemPromptOptions && typeof base.systemPromptOptions === 'object'
+	            ? base.systemPromptOptions
+	            : {};
+	        const seedRecord = (value) => (value && typeof value === 'object' && !Array.isArray(value))
+	            ? Object.assign({}, value)
+	            : {};
+	        const systemPromptOptions = {
+	            customPrompt: seedOptions.customPrompt,
+	            forceSystemPrompt: seedOptions.forceSystemPrompt,
+	            selectedTools: Array.isArray(seedOptions.selectedTools) ? seedOptions.selectedTools.slice() : [],
+	            toolSnippets: seedRecord(seedOptions.toolSnippets),
+	            toolGuidelines: seedRecord(seedOptions.toolGuidelines),
+	            promptGuidelines: Array.isArray(seedOptions.promptGuidelines) ? seedOptions.promptGuidelines.slice() : [],
+	            appendSystemPrompt: typeof seedOptions.appendSystemPrompt === 'string' ? seedOptions.appendSystemPrompt : '',
+	            sections: seedRecord(seedOptions.sections),
+	            cwd: typeof seedOptions.cwd === 'string' ? seedOptions.cwd : '',
+	            contextFiles: Array.isArray(seedOptions.contextFiles) ? seedOptions.contextFiles.slice() : [],
+	            skills: Array.isArray(seedOptions.skills) ? seedOptions.skills.slice() : [],
+	        };
 
 	        for (const entry of handlers) {
 	            const handler = entry && entry.handler;
 	            if (typeof handler !== 'function') continue;
-	            const event = { type: 'before_agent_start', prompt, images, systemPrompt: currentSystemPrompt };
+	            const event = { type: 'before_agent_start', prompt, images, systemPrompt: currentSystemPrompt, systemPromptOptions };
 	            let result = undefined;
 	            try {
 	                result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
@@ -23053,11 +23928,13 @@ const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
     registerMcpServer: __pi_register_mcp_server,
     registerShortcut: __pi_register_shortcut,
     registerMessageRenderer: __pi_register_message_renderer,
+    registerEntryRenderer: __pi_register_entry_renderer,
     on: __pi_register_hook,
     registerFlag: __pi_register_flag,
     getFlag: __pi_get_flag,
     setActiveTools: __pi_set_active_tools,
     getActiveTools: __pi_get_active_tools,
+    getAllTools: __pi_get_all_tools,
     getModel: __pi_get_model,
     setModel: __pi_set_model,
     getThinkingLevel: __pi_get_thinking_level,

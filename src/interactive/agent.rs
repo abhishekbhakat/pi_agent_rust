@@ -84,13 +84,22 @@ async fn dispatch_input_event(
     Ok(apply_input_event_response(response, text, images))
 }
 
-fn before_agent_start_payload(prompt: &str, images: &[ImageContent], system_prompt: &str) -> Value {
+fn before_agent_start_payload(
+    prompt: &str,
+    images: &[ImageContent],
+    system_prompt: &str,
+    system_prompt_options: Option<&Value>,
+) -> Value {
     let images_value = serde_json::to_value(images).unwrap_or(Value::Null);
-    json!({
+    let mut payload = json!({
         "prompt": prompt,
         "images": images_value,
         "systemPrompt": system_prompt,
-    })
+    });
+    if let Some(options) = system_prompt_options {
+        payload["systemPromptOptions"] = options.clone();
+    }
+    payload
 }
 
 async fn dispatch_before_agent_start_event(
@@ -99,7 +108,10 @@ async fn dispatch_before_agent_start_event(
     images: &[ImageContent],
     system_prompt: &str,
 ) -> BeforeAgentStartOutcome {
-    let payload = before_agent_start_payload(prompt, images, system_prompt);
+    // gh #167: normalized options ride along so handlers see TS pi's
+    // `systemPromptOptions` (skills, cwd, selectedTools).
+    let system_prompt_options = manager.system_prompt_options();
+    let payload = before_agent_start_payload(prompt, images, system_prompt, system_prompt_options.as_ref());
     let response = manager
         .dispatch_event_with_response(
             ExtensionEventName::BeforeAgentStart,
@@ -4156,13 +4168,14 @@ mod stream_delta_batcher_tests {
             data: "aW1hZ2U=".to_string(),
             mime_type: "image/png".to_string(),
         };
-        let payload = before_agent_start_payload("hello", &[image], "base-system");
+        let payload = before_agent_start_payload("hello", &[image], "base-system", None);
         assert_eq!(payload["prompt"], json!("hello"));
         assert_eq!(
             payload["images"],
             json!([{"data": "aW1hZ2U=", "mimeType": "image/png"}])
         );
         assert_eq!(payload["systemPrompt"], json!("base-system"));
+        assert!(payload.get("systemPromptOptions").is_none());
     }
 
     fn runtime() -> &'static asupersync::runtime::Runtime {

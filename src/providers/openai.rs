@@ -363,6 +363,7 @@ impl OpenAIProvider {
                         .as_ref()
                         .and_then(|c| c.thinking_level_map.as_ref())
                         .and_then(|map| map.get(level.to_string().as_str()))
+                        .and_then(Option::as_ref)
                         .map(String::as_str);
                     let effort = mapped.or(match level {
                         ThinkingLevel::High => Some("high"),
@@ -422,6 +423,7 @@ impl OpenAIProvider {
             .as_ref()
             .and_then(|c| c.thinking_level_map.as_ref())
             .and_then(|map| map.get(level.to_string().as_str()))
+            .and_then(Option::as_ref)
             .map(|value| value.trim())
             .filter(|value| !value.is_empty());
         match mapped {
@@ -1229,6 +1231,68 @@ where
             .push_back(StreamEvent::Done { reason, message });
     }
 
+    /// Append a reasoning delta, opening a thinking block when the last
+    /// block is not already one.
+    fn push_thinking_delta(&mut self, delta: String) {
+        let last_is_thinking = matches!(self.partial.content.last(), Some(ContentBlock::Thinking(_)));
+
+        let content_index = if last_is_thinking {
+            self.partial.content.len() - 1
+        } else {
+            let idx = self.partial.content.len();
+            self.partial
+                .content
+                .push(ContentBlock::Thinking(ThinkingContent {
+                    thinking: String::new(),
+                    thinking_signature: None,
+                }));
+
+            self.pending_events
+                .push_back(StreamEvent::ThinkingStart { content_index: idx });
+
+            idx
+        };
+
+        if let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(content_index) {
+            t.thinking.push_str(&delta);
+        }
+
+        self.pending_events.push_back(StreamEvent::ThinkingDelta {
+            content_index,
+            delta,
+        });
+    }
+
+    /// Append a text delta, opening a text block when the last block is not
+    /// already one.
+    fn push_text_delta(&mut self, delta: String) {
+        let last_is_text = matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
+
+        let content_index = if last_is_text {
+            self.partial.content.len() - 1
+        } else {
+            let idx = self.partial.content.len();
+
+            self.partial
+                .content
+                .push(ContentBlock::Text(TextContent::new("")));
+
+            self.pending_events
+                .push_back(StreamEvent::TextStart { content_index: idx });
+
+            idx
+        };
+
+        if let Some(ContentBlock::Text(t)) = self.partial.content.get_mut(content_index) {
+            t.text.push_str(&delta);
+        }
+
+        self.pending_events.push_back(StreamEvent::TextDelta {
+            content_index,
+            delta,
+        });
+    }
+
     #[allow(clippy::too_many_lines)]
     fn process_choice(&mut self, choice: OpenAIChoice) {
         let delta = choice.delta;
@@ -1241,8 +1305,8 @@ where
             }
             let has_content = delta
                 .content
-                .as_deref()
-                .is_some_and(|text| !text.is_empty())
+                .as_ref()
+                .is_some_and(|content| content.has_payload())
                 || delta
                     .reasoning_content
                     .as_deref()
@@ -1273,68 +1337,18 @@ where
 
         // Handle reasoning content (e.g. DeepSeek R1)
         if let Some(reasoning) = delta.reasoning_content {
-            // Update partial content
-            let last_is_thinking =
-                matches!(self.partial.content.last(), Some(ContentBlock::Thinking(_)));
-
-            let content_index = if last_is_thinking {
-                self.partial.content.len() - 1
-            } else {
-                let idx = self.partial.content.len();
-                self.partial
-                    .content
-                    .push(ContentBlock::Thinking(ThinkingContent {
-                        thinking: String::new(),
-                        thinking_signature: None,
-                    }));
-
-                self.pending_events
-                    .push_back(StreamEvent::ThinkingStart { content_index: idx });
-
-                idx
-            };
-
-            if let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(content_index) {
-                t.thinking.push_str(&reasoning);
-            }
-
-            self.pending_events.push_back(StreamEvent::ThinkingDelta {
-                content_index,
-                delta: reasoning,
-            });
+            self.push_thinking_delta(reasoning);
         }
 
-        // Handle text content
-
+        // Handle text content — a plain string, or typed parts
+        // (mistral-conversations streams thinking/text blocks here).
         if let Some(content) = delta.content {
-            // Update partial content
-
-            let last_is_text = matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
-
-            let content_index = if last_is_text {
-                self.partial.content.len() - 1
-            } else {
-                let idx = self.partial.content.len();
-
-                self.partial
-                    .content
-                    .push(ContentBlock::Text(TextContent::new("")));
-
-                self.pending_events
-                    .push_back(StreamEvent::TextStart { content_index: idx });
-
-                idx
-            };
-
-            if let Some(ContentBlock::Text(t)) = self.partial.content.get_mut(content_index) {
-                t.text.push_str(&content);
+            for part in content.0 {
+                match part {
+                    DeltaContentPart::Thinking(text) => self.push_thinking_delta(text),
+                    DeltaContentPart::Text(text) => self.push_text_delta(text),
+                }
             }
-
-            self.pending_events.push_back(StreamEvent::TextDelta {
-                content_index,
-
-                delta: content,
-            });
         }
 
         // Handle tool calls
@@ -1674,11 +1688,114 @@ struct OpenAIChoice {
 #[derive(Debug, Deserialize)]
 struct OpenAIDelta {
     #[serde(default)]
-    content: Option<String>,
+    content: Option<OpenAIDeltaContent>,
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAIToolCallDelta>>,
+}
+
+/// One streamed `delta.content` part, normalised.
+///
+/// Most OpenAI-compatible providers send `content` as a plain string.
+/// mistral-conversations streams an array of typed parts instead:
+/// `{"type":"thinking","thinking":[{"type":"text","text":"..."}]}` for
+/// reasoning and `{"type":"text","text":"..."}` for output text. Both
+/// shapes normalise to ordered text/thinking parts; unknown shapes are
+/// dropped rather than failing the whole chunk.
+#[derive(Debug)]
+enum DeltaContentPart {
+    Text(String),
+    Thinking(String),
+}
+
+#[derive(Debug, Default)]
+struct OpenAIDeltaContent(Vec<DeltaContentPart>);
+
+impl OpenAIDeltaContent {
+    /// Any part carrying a non-empty payload.
+    fn has_payload(&self) -> bool {
+        self.0.iter().any(|part| match part {
+            DeltaContentPart::Text(text) | DeltaContentPart::Thinking(text) => !text.is_empty(),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for OpenAIDeltaContent {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = OpenAIDeltaContent;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a string or an array of content parts")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(OpenAIDeltaContent(vec![DeltaContentPart::Text(
+                    value.to_string(),
+                )]))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut parts = Vec::new();
+                while let Some(item) = seq.next_element::<serde_json::Value>()? {
+                    if let Some(part) = delta_content_part(&item) {
+                        parts.push(part);
+                    }
+                }
+                Ok(OpenAIDeltaContent(parts))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// Normalise one array element of a streamed `delta.content`.
+fn delta_content_part(item: &serde_json::Value) -> Option<DeltaContentPart> {
+    match item {
+        serde_json::Value::String(text) => Some(DeltaContentPart::Text(text.clone())),
+        serde_json::Value::Object(map) => {
+            let kind = map.get("type").and_then(serde_json::Value::as_str)?;
+            match kind {
+                "thinking" => {
+                    let thinking = map.get("thinking")?;
+                    let text = match thinking {
+                        serde_json::Value::String(text) => text.clone(),
+                        serde_json::Value::Array(blocks) => blocks
+                            .iter()
+                            .filter_map(|block| {
+                                block
+                                    .as_object()
+                                    .and_then(|obj| obj.get("text"))
+                                    .and_then(serde_json::Value::as_str)
+                            })
+                            .collect::<Vec<&str>>()
+                            .join(""),
+                        _ => return None,
+                    };
+                    Some(DeltaContentPart::Thinking(text))
+                }
+                "text" => map
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|text| DeltaContentPart::Text(text.to_string())),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2371,9 +2488,9 @@ mod tests {
             .with_reasoning(true)
             .with_compat(Some(CompatConfig {
                 thinking_level_map: Some(HashMap::from([
-                    ("xhigh".to_string(), "high".to_string()),
-                    ("medium".to_string(), "medium".to_string()),
-                    ("off".to_string(), "none".to_string()),
+                    ("xhigh".to_string(), Some("high".to_string())),
+                    ("medium".to_string(), Some("medium".to_string())),
+                    ("off".to_string(), Some("none".to_string())),
                 ])),
                 ..Default::default()
             }));
@@ -2884,11 +3001,11 @@ mod tests {
             .with_reasoning(true)
             .with_compat(Some(CompatConfig {
                 thinking_level_map: Some(HashMap::from([
-                    ("high".to_string(), "8000".to_string()),
-                    ("max".to_string(), " 32000 ".to_string()),
-                    ("low".to_string(), "minimal".to_string()),
-                    ("off".to_string(), "none".to_string()),
-                    ("medium".to_string(), "0".to_string()),
+                    ("high".to_string(), Some("8000".to_string())),
+                    ("max".to_string(), Some(" 32000 ".to_string())),
+                    ("low".to_string(), Some("minimal".to_string())),
+                    ("off".to_string(), Some("none".to_string())),
+                    ("medium".to_string(), Some("0".to_string())),
                 ])),
                 ..Default::default()
             }));

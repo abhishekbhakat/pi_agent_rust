@@ -233,6 +233,7 @@ fn responses_effort_for_level(
     if let Some(mapped) = compat
         .and_then(|c| c.thinking_level_map.as_ref())
         .and_then(|map| map.get(name.as_str()))
+        .and_then(Option::as_ref)
     {
         return mapped.clone();
     }
@@ -2492,8 +2493,8 @@ mod tests {
     fn test_build_request_thinking_level_map_overrides_effort() {
         let compat = CompatConfig {
             thinking_level_map: Some(HashMap::from([
-                ("xhigh".to_string(), "max".to_string()),
-                ("high".to_string(), "high".to_string()),
+                ("xhigh".to_string(), Some("max".to_string())),
+                ("high".to_string(), Some("high".to_string())),
             ])),
             ..CompatConfig::default()
         };
@@ -2564,7 +2565,10 @@ mod tests {
         let mapped = OpenAIResponsesProvider::new("gpt-5.2-codex")
             .with_codex_mode(true)
             .with_compat(Some(CompatConfig {
-                thinking_level_map: Some(HashMap::from([("xhigh".to_string(), "max".to_string())])),
+                thinking_level_map: Some(HashMap::from([(
+                    "xhigh".to_string(),
+                    Some("max".to_string()),
+                )])),
                 ..CompatConfig::default()
             }));
         let request = mapped.build_request(

@@ -387,6 +387,11 @@ pub struct SessionOptions {
     /// read-tool rule applied). `None` lists no skills, which is what an
     /// embedder that loads no skills gets.
     pub skills_prompt: Option<String>,
+    /// Pre-built normalized `systemPromptOptions` for `before_agent_start`
+    /// extension events (gh #167), parity with TS pi. The CLI host passes
+    /// its resource loader's skills; `None` synthesizes a minimal shape
+    /// (cwd + selectedTools, empty skills).
+    pub system_prompt_options: Option<serde_json::Value>,
     /// `--no-context-files` (gh #216): the host owns the whole prompt, so no
     /// AGENTS.md / CLAUDE.md and no foreign workspace rules are loaded.
     pub no_context_files: bool,
@@ -569,6 +574,7 @@ impl Default for SessionOptions {
             repair_policy: None,
             include_cwd_in_prompt: true,
             skills_prompt: None,
+            system_prompt_options: None,
             no_context_files: false,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
             retry: None,
@@ -3083,6 +3089,15 @@ pub(crate) async fn create_agent_session_deferred_mcp(
                 },
             )
             .await?;
+        // gh #167: `before_agent_start` events carry TS pi's normalized
+        // `systemPromptOptions`. Embedders without a resource loader get the
+        // minimal shape (cwd + selectedTools, empty skills).
+        if let Some(region) = &agent_session.extensions {
+            let options_value = options.system_prompt_options.clone().unwrap_or_else(|| {
+                crate::agent::extension_system_prompt_options(&[], &cwd, &enabled_tools)
+            });
+            region.manager().set_system_prompt_options(options_value);
+        }
         extension_bootstrap::finish_selection(
             &mut agent_session,
             &mut model_registry,

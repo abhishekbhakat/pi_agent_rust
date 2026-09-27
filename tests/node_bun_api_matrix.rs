@@ -754,6 +754,37 @@ fn shell_quote_roundtrip() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// marked / shlex (vendored real packages)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn marked_lexer_tokenizes_markdown() {
+    let result = eval_ext(
+        r#"import { lexer } from "marked";"#,
+        r##"lexer("# Title\n\nsome `code` here").map((t) => t.type).join(",")"##,
+    );
+    assert_eq!(result, "heading,space,paragraph");
+}
+
+#[test]
+fn marked_parse_renders_html() {
+    let result = eval_ext(
+        r#"import { marked } from "marked";"#,
+        r#"marked.parse("**bold**").trim()"#,
+    );
+    assert_eq!(result, "<p><strong>bold</strong></p>");
+}
+
+#[test]
+fn shlex_split_honours_quotes() {
+    let result = eval_ext(
+        r#"import * as shlex from "shlex";"#,
+        r#"JSON.stringify(shlex.split("rm -rf 'a b' \"c d\""))"#,
+    );
+    assert_eq!(result, r#"["rm","-rf","a b","c d"]"#);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ms
 // ═══════════════════════════════════════════════════════════════════════════
 

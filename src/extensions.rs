@@ -13521,7 +13521,7 @@ fn resolve_package_declared_entries(
 /// `~/.pi/agent/extensions/` or `.pi/extensions/`). Entries that live
 /// directly inside such a directory are independent extensions by
 /// convention, never fragments of a single package or workspace bundle.
-fn is_independent_extensions_root(dir: &Path) -> bool {
+pub(crate) fn is_independent_extensions_root(dir: &Path) -> bool {
     dir.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.eq_ignore_ascii_case("extensions"))
@@ -13733,12 +13733,52 @@ async fn build_js_runtime_shards(
             }
         }
 
+        let mut shard_load_failed = false;
         for (spec, entry_paths) in extension_specs {
-            load_one_extension(&runtime, host, spec, &entry_paths, origin, root_deadline).await?;
+            if let Err(err) =
+                load_one_extension(&runtime, host, spec, &entry_paths, origin, root_deadline)
+                    .await
+            {
+                // Upstream pi skips an extension whose load fails and keeps
+                // loading the rest; one broken extension must not abort the
+                // session. Keep the shard only when the extension still
+                // produced a usable registry snapshot.
+                tracing::warn!(
+                    event = "extension.load.skipped",
+                    extension_id = %spec.extension_id,
+                    error = %err,
+                    "Extension failed to load; skipping it"
+                );
+                eprintln!(
+                    "Warning: extension {} failed to load and was skipped: {err}",
+                    spec.extension_id
+                );
+                shard_load_failed = true;
+            }
         }
 
-        let snapshot =
-            require_single_shard_snapshot(snapshot_extensions(&runtime).await?, &extension_id)?;
+        let snapshots = snapshot_extensions(&runtime).await?;
+        if shard_load_failed && snapshots.is_empty() {
+            tracing::warn!(
+                event = "extension.shard.skipped",
+                extension_id = %extension_id,
+                "Shard produced no extension snapshot after load failure; dropping shard"
+            );
+            continue;
+        }
+        let snapshot = match require_single_shard_snapshot(snapshots, &extension_id) {
+            Ok(snapshot) => snapshot,
+            Err(err) if shard_load_failed => {
+                tracing::warn!(
+                    event = "extension.shard.skipped",
+                    extension_id = %extension_id,
+                    error = %err,
+                    "Shard snapshot unusable after load failure; dropping shard"
+                );
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         candidate.shards.push(JsRuntimeShard {
             extension_id,
             runtime,
@@ -13872,6 +13912,24 @@ async fn load_one_extension(
     // monorepo escape patterns (Pattern 3).
     for root in collect_extension_roots_from_paths(entry_paths) {
         runtime.add_extension_root_with_id(root, Some(spec.extension_id.as_str()));
+    }
+
+    // Extensions that live under an independent-extensions directory
+    // (`~/.pi/agent/extensions/`, `.pi/extensions/`) may import shared
+    // helper modules from sibling directories (e.g. `../shared/util.ts`),
+    // matching upstream pi's unrestricted relative resolution inside the
+    // extensions tree. Register the extensions base directory so the
+    // resolver treats the whole tree as in-scope; everything outside it
+    // remains a monorepo escape.
+    for entry_path in entry_paths {
+        let mut ancestor = entry_path.parent().map(Path::to_path_buf);
+        while let Some(dir) = ancestor {
+            if is_independent_extensions_root(&dir) {
+                runtime.add_extension_root(dir.clone());
+                break;
+            }
+            ancestor = dir.parent().map(Path::to_path_buf);
+        }
     }
 
     let meta = json!({
@@ -14216,7 +14274,12 @@ fn input_event_payload(text: &str, images: Option<&Value>, source: &Value) -> Va
     Value::Object(payload)
 }
 
-fn before_agent_start_payload(prompt: &str, images: Option<&Value>, system_prompt: &str) -> Value {
+fn before_agent_start_payload(
+    prompt: &str,
+    images: Option<&Value>,
+    system_prompt: &str,
+    system_prompt_options: Option<&Value>,
+) -> Value {
     let mut payload = serde_json::Map::from_iter([
         (
             "type".to_string(),
@@ -14230,6 +14293,9 @@ fn before_agent_start_payload(prompt: &str, images: Option<&Value>, system_promp
     ]);
     if let Some(images) = images {
         payload.insert("images".to_string(), images.clone());
+    }
+    if let Some(options) = system_prompt_options {
+        payload.insert("systemPromptOptions".to_string(), options.clone());
     }
     Value::Object(payload)
 }
@@ -14359,12 +14425,20 @@ async fn dispatch_extension_event_across_shards_until(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        // gh #167: normalized options ride along untouched; the JS bridge
+        // seeds each handler's mutable `systemPromptOptions` from them.
+        let system_prompt_options = event_payload.get("systemPromptOptions").cloned();
         let mut modified = false;
         let mut messages = Vec::new();
 
         for phase in ["direct", "event_bus"] {
             for &shard_index in &owners {
-                let payload = before_agent_start_payload(&prompt, images.as_ref(), &system_prompt);
+                let payload = before_agent_start_payload(
+                    &prompt,
+                    images.as_ref(),
+                    &system_prompt,
+                    system_prompt_options.as_ref(),
+                );
                 let Some(value) = dispatch_extension_event_phase_sharded(
                     shards,
                     host,
@@ -19199,6 +19273,7 @@ async fn dispatch_hostcall_events_ref(
                 result.push(json!({
                     "name": tool.name(),
                     "description": tool.description(),
+                    "parameters": tool.parameters(),
                 }));
             }
             for def in tool_defs {
@@ -19210,6 +19285,7 @@ async fn dispatch_hostcall_events_ref(
                 result.push(json!({
                     "name": name,
                     "description": description,
+                    "parameters": def.get("parameters").cloned().unwrap_or(serde_json::Value::Null),
                 }));
             }
             HostcallOutcome::Success(json!({ "tools": result }))
@@ -20018,6 +20094,10 @@ pub(crate) struct RegistrySnapshot {
     /// `ctx.getSystemPrompt()` is answerable before the first
     /// `before_agent_start` dispatch (gh #167).
     pub current_system_prompt: Option<String>,
+    /// Builtin (host) tool definitions seeded at extension boot so
+    /// `pi.getAllTools()` is answerable synchronously, matching TS pi's
+    /// `getAllTools(): ToolInfo[]` (gh #167).
+    pub builtin_tool_defs: Arc<Vec<Value>>,
     /// Global kill-switch for hostcall compatibility lane.
     // The live path reads kill switches from the guarded manager state; the
     // snapshot copies them for read-only diagnostics and future RCU consumers.
@@ -20145,6 +20225,12 @@ struct ExtensionManagerInner {
     extension_models: Arc<Vec<Value>>,
     /// Current effective system prompt (gh #167), seeded at extension boot.
     current_system_prompt: Option<String>,
+    /// Builtin (host) tool definitions (gh #167), seeded at extension boot.
+    builtin_tool_defs: Arc<Vec<Value>>,
+    /// Normalized system-prompt options surfaced on `before_agent_start`
+    /// events, parity with TS pi's `NormalizedBuildSystemPromptOptions`
+    /// (gh #167). Seeded by the host after resources (skills) are final.
+    system_prompt_options: Option<Value>,
     host_actions: Option<Arc<dyn ExtensionHostActions>>,
     policy_prompt_cache: HashMap<String, HashMap<String, PersistedDecision>>,
     /// Persistent store for "Allow Always" / "Deny Always" decisions.

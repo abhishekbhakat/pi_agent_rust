@@ -228,6 +228,7 @@ const REGISTRATION_METHODS: &[&str] = &[
     "registerShortcut",
     "registerFlag",
     "registerMessageRenderer",
+    "registerEntryRenderer",
 ];
 
 /// Classify a candidate based on code-level evidence.

@@ -346,6 +346,11 @@ fn resolve_provider_route(entry: &ModelEntry) -> Result<(ProviderRouteKind, Stri
         _ => match effective_api.as_str() {
             "anthropic-messages" => ProviderRouteKind::ApiAnthropicMessages,
             "openai-completions" => ProviderRouteKind::ApiOpenAICompletions,
+            // TS pi-ai's `mistral-conversations` is the Mistral chat
+            // completions endpoint (`{base}/v1/chat/completions`) — the same
+            // wire format the OpenAI-completions adapter speaks, so route it
+            // there rather than failing provider creation (gh #167).
+            "mistral-conversations" => ProviderRouteKind::ApiOpenAICompletions,
             "openai-responses" => ProviderRouteKind::ApiOpenAIResponses,
             "openai-codex-responses" => ProviderRouteKind::ApiOpenAICodexResponses,
             "cohere-chat" => ProviderRouteKind::ApiCohereChat,

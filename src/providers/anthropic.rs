@@ -416,7 +416,7 @@ fn anthropic_effort_for_level(
     compat: Option<&CompatConfig>,
 ) -> Option<String> {
     if let Some(map) = compat.and_then(|c| c.thinking_level_map.as_ref())
-        && let Some(mapped) = map.get(level.to_string().as_str())
+        && let Some(Some(mapped)) = map.get(level.to_string().as_str())
     {
         return Some(mapped.clone());
     }
@@ -2193,7 +2193,7 @@ mod tests {
     #[test]
     fn test_build_request_thinking_level_map_overrides_effort() {
         let mut map = HashMap::new();
-        map.insert("xhigh".to_string(), "max".to_string());
+        map.insert("xhigh".to_string(), Some("max".to_string()));
         let compat = CompatConfig {
             thinking_level_map: Some(map),
             ..CompatConfig::default()

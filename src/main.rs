@@ -570,15 +570,17 @@ async fn resolve_selection_with_auth(
     allow_setup_prompt: bool,
     extension_bindings: &[ExtensionProviderBinding],
     extra_entries: &[ModelEntry],
+    warn_scope: bool,
 ) -> Result<Option<(pi::app::ModelSelection, Option<String>)>> {
     loop {
         let scoped_models = if scoped_patterns.is_empty() {
             Vec::new()
         } else {
-            pi::app::resolve_model_scope(
+            pi::app::resolve_model_scope_with_warnings(
                 scoped_patterns,
                 model_registry,
                 has_cli_api_key_override(cli.api_key.as_deref()),
+                warn_scope,
             )
         };
 
@@ -1969,13 +1971,18 @@ async fn run(
         config.enabled_models.clone().unwrap_or_default()
     };
     let disabled_providers = config.disabled_providers.clone().unwrap_or_default();
+    let has_extensions = !resources.extensions().is_empty();
+    // Pre-merge scope resolution stays quiet when extensions are pending:
+    // extension-registered providers are merged later and the final
+    // resolution pass warns once per unmatched pattern (TS parity).
     let scoped_models = if scoped_patterns.is_empty() {
         Vec::new()
     } else {
-        pi::app::resolve_model_scope(
+        pi::app::resolve_model_scope_with_warnings(
             &scoped_patterns,
             &model_registry,
             has_cli_api_key_override(cli.api_key.as_deref()),
+            !has_extensions,
         )
         .into_iter()
         .filter(|scoped| {
@@ -1987,7 +1994,6 @@ async fn run(
         })
         .collect()
     };
-    let has_extensions = !resources.extensions().is_empty();
 
     if has_cli_api_key_override(cli.api_key.as_deref())
         && cli.provider.is_none()
@@ -2034,6 +2040,7 @@ async fn run(
         allow_setup_prompt,
         &[],
         &[],
+        !has_extensions,
     )
     .await
     {
@@ -2166,6 +2173,14 @@ async fn run(
             skills_prompt: enabled_tools
                 .contains(&"read")
                 .then(|| resources.format_skills_for_prompt()),
+            // gh #167: structured skills for `before_agent_start`'s
+            // `systemPromptOptions`; the SDK synthesizes the minimal shape
+            // when a host loads no resources.
+            system_prompt_options: Some(pi::agent::extension_system_prompt_options(
+                resources.skills(),
+                &cwd,
+                &enabled_tools,
+            )),
             max_tool_iterations,
             package_dir: Some(package_dir.clone()),
             mcp: Some(pi::sdk::McpSessionOptions {
@@ -2664,6 +2679,12 @@ async fn run(
     // The classic/RPC session owns this manager; FTUI's SDK-owned manager
     // performs its own connect-and-mount pass after that session's
     // extensions load (bd-vjfol).
+    // gh #167: `before_agent_start` events carry TS pi's normalized
+    // `systemPromptOptions` (skills, cwd, selectedTools). Built here, before
+    // `cli` is mutably borrowed, and seeded after `discover_resources` so
+    // extension-contributed skills are in.
+    let extension_system_prompt_options_value =
+        pi::agent::extension_system_prompt_options(resources.skills(), &cwd, &enabled_tools);
     let mcp_wrappers = pi::mcp::connect_trusted_and_mount_tools(&mcp_manager).await;
     if !mcp_wrappers.is_empty() {
         agent_session.agent.extend_tools(mcp_wrappers);
@@ -2691,6 +2712,7 @@ async fn run(
             allow_setup_prompt,
             &extension_bindings,
             &extension_model_entries,
+            true,
         )
         .await?;
         let Some((updated_selection, updated_key)) = final_selection else {
@@ -2736,6 +2758,11 @@ async fn run(
         agent_session
             .set_compaction_context_window(context_window_tokens_for_entry(&selection.model_entry));
         agent_session.refresh_extension_completion_host_state();
+        if let Some(region) = &agent_session.extensions {
+            region
+                .manager()
+                .set_system_prompt_options(extension_system_prompt_options_value);
+        }
         if let Some(region) = &agent_session.extensions {
             region.manager().set_current_model(
                 Some(selection.model_entry.model.provider.clone()),

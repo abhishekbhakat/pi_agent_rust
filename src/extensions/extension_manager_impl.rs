@@ -157,6 +157,7 @@ impl ExtensionManager {
             current_thinking_level: inner.current_thinking_level.clone(),
             extension_models: Arc::clone(&inner.extension_models),
             current_system_prompt: inner.current_system_prompt.clone(),
+            builtin_tool_defs: Arc::clone(&inner.builtin_tool_defs),
             hostcall_compat_kill_switch_global: inner.hostcall_compat_kill_switch_global,
             hostcall_compat_kill_switch_extensions: inner
                 .hostcall_compat_kill_switch_extensions
@@ -3622,6 +3623,43 @@ impl ExtensionManager {
         self.refresh_snapshot_with_guard_release(guard);
     }
 
+    /// Publish the builtin (host) tool definitions so extensions can call
+    /// `pi.getAllTools()` synchronously — parity with TS pi's
+    /// `getAllTools(): ToolInfo[]`, which never round-trips a hostcall
+    /// (gh #167). Extension-registered tools are merged into the ctx
+    /// payload from the registry snapshot at dispatch time.
+    pub fn set_builtin_tool_defs(&self, defs: Vec<Value>) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.builtin_tool_defs = Arc::new(defs);
+        guard.ctx_generation = guard.ctx_generation.wrapping_add(1);
+        self.refresh_snapshot_with_guard_release(guard);
+    }
+
+    /// Publish the normalized system-prompt options surfaced on
+    /// `before_agent_start` events (gh #167), parity with TS pi's
+    /// `NormalizedBuildSystemPromptOptions`. Seeded by the host once
+    /// resources (skills, cwd, selected tools) are final.
+    pub fn set_system_prompt_options(&self, options: Value) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.system_prompt_options = Some(options);
+    }
+
+    /// The normalized system-prompt options for `before_agent_start`
+    /// payloads. `None` until the host seeds them.
+    pub fn system_prompt_options(&self) -> Option<Value> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .system_prompt_options
+            .clone()
+    }
+
     /// Collect tool definitions from all registered extensions.
     ///
     /// Uses the pre-computed snapshot (RCU) instead of locking the mutex.
@@ -4011,6 +4049,14 @@ impl ExtensionManager {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            // Providers backed by a JS `streamSimple` handler manage their own
+            // auth (the host never builds HTTP requests for them), so they must
+            // not be gated on a configured api_key credential.
+            let has_stream_simple = provider_spec
+                .get("hasStreamSimple")
+                .and_then(Value::as_bool)
+                .or_else(|| provider_spec.get("streamSimple").and_then(Value::as_bool))
+                .unwrap_or(false);
 
             // Resolve API key (supports env var names).
             let resolved_key = if api_key_ref.is_empty() {
@@ -4175,7 +4221,7 @@ impl ExtensionManager {
                     },
                     api_key: resolved_key.clone(),
                     headers: model_headers,
-                    auth_header: true,
+                    auth_header: !has_stream_simple,
                     compat: None,
                     oauth_config: oauth_config.clone(),
                 });
@@ -4477,6 +4523,16 @@ impl ExtensionManager {
         // prompt from before_agent_start payloads inside the JS bridge).
         if let Some(prompt) = current_system_prompt {
             ctx.insert("systemPrompt".into(), Value::String(prompt.to_string()));
+        }
+
+        // gh #167 parity: builtin + extension tool definitions backing the
+        // synchronous `pi.getAllTools()` mirror in the JS bridge. Builtin
+        // defs are seeded via `set_builtin_tool_defs`; extension defs come
+        // from the pre-computed registry view.
+        if !snap.builtin_tool_defs.is_empty() || !snap.all_tool_defs.is_empty() {
+            let mut all_tools: Vec<Value> = snap.builtin_tool_defs.as_ref().clone();
+            all_tools.extend(snap.all_tool_defs.iter().cloned());
+            ctx.insert("allTools".into(), Value::Array(all_tools));
         }
 
         Value::Object(ctx)

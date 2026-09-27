@@ -8147,6 +8147,11 @@ async fn create_driver_session(
     match crate::sdk::create_agent_session(session_options).await {
         Ok(handle) => Some((handle, ext_handler)),
         Err(err) => {
+            tracing::error!(
+                event = "ftui.session.create.failed",
+                error = %err,
+                "FTUI driver session creation failed"
+            );
             let _ = agent_tx.send(PiMsg::AgentError(format!("session: {err}")));
             None
         }

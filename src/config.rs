@@ -69,6 +69,12 @@ pub struct Config {
     pub default_model: Option<String>,
     #[serde(alias = "defaultThinkingLevel")]
     pub default_thinking_level: Option<String>,
+    /// Per-model default thinking levels (TS pi `modelThinkingLevels`):
+    /// model id -> level ("off" | "minimal" | "low" | "medium" | "high" |
+    /// "xhigh" | "max"). Recognised so a settings.json shared with TS pi does
+    /// not warn; per-model levels are not applied by this build.
+    #[serde(alias = "modelThinkingLevels")]
+    pub model_thinking_levels: Option<std::collections::HashMap<String, String>>,
     #[serde(alias = "enabledModels")]
     pub enabled_models: Option<Vec<String>>,
     /// Per-role model assignments (see [`ModelRoleSettings`], bd-cv653.3.1).
@@ -141,6 +147,22 @@ pub struct Config {
     // Version check
     #[serde(alias = "checkForUpdates")]
     pub check_for_updates: Option<bool>,
+
+    /// Install-telemetry opt-in (TS pi `enableInstallTelemetry`). This build
+    /// ships no install telemetry; the key is recognised so a shared
+    /// settings.json does not warn.
+    #[serde(alias = "enableInstallTelemetry")]
+    pub enable_install_telemetry: Option<bool>,
+
+    /// Cache-miss notice display (TS pi `showCacheMissNotices`). Recognised
+    /// for settings compatibility; this build has no cache-miss notices.
+    #[serde(alias = "showCacheMissNotices")]
+    pub show_cache_miss_notices: Option<bool>,
+
+    /// Event transport (TS pi `transport`: "standard" | "websocket").
+    /// Recognised for settings compatibility; this build always uses
+    /// standard stdio transport.
+    pub transport: Option<String>,
 
     // Terminal Behavior
     #[serde(alias = "quietStartup")]
@@ -236,6 +258,13 @@ pub struct Config {
     // only honored when set in the GLOBAL settings file.
     #[serde(alias = "trustAllWorkspaces")]
     pub trust_all_workspaces: Option<bool>,
+
+    /// Default answer for the first-use project-trust prompt (TS pi
+    /// `defaultProjectTrust`: "ask" | "always" | "never"). Recognised for
+    /// settings compatibility; this build's trust prompt is governed by
+    /// `trustAllWorkspaces`.
+    #[serde(alias = "defaultProjectTrust")]
+    pub default_project_trust: Option<String>,
 
     // Extensions/Skills/etc.
     pub packages: Option<Vec<PackageSource>>,
@@ -640,6 +669,10 @@ pub struct MarkdownSettings {
     /// after every block; "compact" drops the blanks between paragraphs and
     /// list items while keeping one line of air around headings and fences.
     pub spacing: Option<MarkdownSpacing>,
+    /// Mermaid diagram rendering mode (TS pi `markdown.mermaid`:
+    /// "off" | "final" | "streaming"). Recognised for settings
+    /// compatibility; this build renders mermaid blocks as plain code.
+    pub mermaid: Option<String>,
 }
 
 /// Inter-block spacing policy for transcript markdown (issue #202).
@@ -897,6 +930,9 @@ impl Config {
             default_provider: other.default_provider.or(base.default_provider),
             default_model: other.default_model.or(base.default_model),
             default_thinking_level: other.default_thinking_level.or(base.default_thinking_level),
+            model_thinking_levels: other
+                .model_thinking_levels
+                .or(base.model_thinking_levels),
             enabled_models: other.enabled_models.or(base.enabled_models),
             model_roles: merge_model_roles(base.model_roles, other.model_roles),
             titling: merge_titling(base.titling, other.titling),
@@ -924,6 +960,13 @@ impl Config {
 
             // Version check
             check_for_updates: other.check_for_updates.or(base.check_for_updates),
+            enable_install_telemetry: other
+                .enable_install_telemetry
+                .or(base.enable_install_telemetry),
+            show_cache_miss_notices: other
+                .show_cache_miss_notices
+                .or(base.show_cache_miss_notices),
+            transport: other.transport.or(base.transport),
 
             // Terminal Behavior
             quiet_startup: other.quiet_startup.or(base.quiet_startup),
@@ -974,6 +1017,9 @@ impl Config {
 
             // Workspace trust
             trust_all_workspaces: other.trust_all_workspaces.or(base.trust_all_workspaces),
+            default_project_trust: other
+                .default_project_trust
+                .or(base.default_project_trust),
 
             // Extensions/Skills/etc.
             packages: other.packages.or(base.packages),
@@ -1893,6 +1939,7 @@ fn merge_markdown(
         (Some(base), Some(other)) => Some(MarkdownSettings {
             code_block_indent: other.code_block_indent.or(base.code_block_indent),
             spacing: other.spacing.or(base.spacing),
+            mermaid: other.mermaid.or(base.mermaid),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

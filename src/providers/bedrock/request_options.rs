@@ -130,6 +130,7 @@ fn effort(level: ThinkingLevel, id: Option<&str>, compat: Option<&CompatConfig>)
     if let Some(mapped) = compat
         .and_then(|config| config.thinking_level_map.as_ref())
         .and_then(|map| map.get(&level.to_string()))
+        .and_then(Option::as_ref)
     {
         if matches!(mapped.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
             return Ok(mapped.clone());
@@ -479,7 +480,10 @@ mod tests {
         );
         let mut compat = CompatConfig {
             force_adaptive_thinking: Some(true),
-            thinking_level_map: Some(HashMap::from([("xhigh".to_string(), "max".to_string())])),
+            thinking_level_map: Some(HashMap::from([(
+                "xhigh".to_string(),
+                Some("max".to_string()),
+            )])),
             ..CompatConfig::default()
         };
         let body = prepare(
@@ -497,7 +501,7 @@ mod tests {
             .thinking_level_map
             .as_mut()
             .unwrap()
-            .insert("xhigh".to_string(), "typo".to_string());
+            .insert("xhigh".to_string(), Some("typo".to_string()));
         assert!(
             prepare(
                 "opaque-profile",

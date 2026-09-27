@@ -118,19 +118,6 @@ pub struct ResourceDiagnostic {
 const MAX_SKILL_NAME_LEN: usize = 64;
 const MAX_SKILL_DESC_LEN: usize = 1024;
 
-const ALLOWED_SKILL_FRONTMATTER: [&str; 8] = [
-    "name",
-    "description",
-    "license",
-    "compatibility",
-    "metadata",
-    "allowed-tools",
-    "disable-model-invocation",
-    // Agent-authored managed skills (bd-cv653.4.2): the marker protects
-    // user-authored skills from manage_skill mutations.
-    "managed",
-];
-
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
@@ -139,6 +126,29 @@ pub struct Skill {
     pub base_dir: PathBuf,
     pub source: String,
     pub disable_model_invocation: bool,
+}
+
+impl Skill {
+    /// TS pi `Skill` shape for extension event payloads (gh #167), e.g.
+    /// `before_agent_start`'s `systemPromptOptions.skills`.
+    pub fn to_extension_value(&self) -> Value {
+        let file_path = self.file_path.display().to_string();
+        let base_dir = self.base_dir.display().to_string();
+        json!({
+            "name": self.name,
+            "description": self.description,
+            "filePath": file_path,
+            "baseDir": base_dir,
+            "sourceInfo": {
+                "path": file_path,
+                "source": self.source,
+                "scope": "user",
+                "origin": "top-level",
+                "baseDir": base_dir,
+            },
+            "disableModelInvocation": self.disable_model_invocation,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1229,16 +1239,6 @@ fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFileResult {
     let parsed = parse_frontmatter(&raw);
     let frontmatter = &parsed.frontmatter;
 
-    let field_errors = validate_frontmatter_fields(frontmatter.keys());
-    for error in field_errors {
-        diagnostics.push(ResourceDiagnostic {
-            kind: DiagnosticKind::Warning,
-            message: error,
-            path: path.to_path_buf(),
-            collision: None,
-        });
-    }
-
     let description = frontmatter.get("description").cloned().unwrap_or_default();
     let desc_errors = validate_description(&description);
     for error in desc_errors {
@@ -1271,7 +1271,7 @@ fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFileResult {
         .cloned()
         .unwrap_or_else(|| parent_dir.clone());
 
-    let name_errors = validate_name(&name, &parent_dir);
+    let name_errors = validate_name(&name);
     for error in name_errors {
         diagnostics.push(ResourceDiagnostic {
             kind: DiagnosticKind::Warning,
@@ -1298,14 +1298,8 @@ fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFileResult {
     }
 }
 
-pub(crate) fn validate_name(name: &str, parent_dir: &str) -> Vec<String> {
+pub(crate) fn validate_name(name: &str) -> Vec<String> {
     let mut errors = Vec::new();
-
-    if name != parent_dir {
-        errors.push(format!(
-            "name \"{name}\" does not match parent directory \"{parent_dir}\""
-        ));
-    }
 
     if name.len() > MAX_SKILL_NAME_LEN {
         errors.push(format!(
@@ -1344,20 +1338,6 @@ pub(crate) fn validate_description(description: &str) -> Vec<String> {
             "description exceeds {MAX_SKILL_DESC_LEN} characters ({})",
             description.len()
         ));
-    }
-    errors
-}
-
-pub(crate) fn validate_frontmatter_fields<'a, I>(keys: I) -> Vec<String>
-where
-    I: IntoIterator<Item = &'a String>,
-{
-    let allowed: HashSet<&str> = ALLOWED_SKILL_FRONTMATTER.into_iter().collect();
-    let mut errors = Vec::new();
-    for key in keys {
-        if !allowed.contains(key.as_str()) {
-            errors.push(format!("unknown frontmatter field \"{key}\""));
-        }
     }
     errors
 }
@@ -3543,12 +3523,7 @@ mod tests {
 
     #[test]
     fn test_validate_name_catches_all_error_categories() {
-        let errors = validate_name("Bad--Name-", "parent");
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("does not match parent directory"))
-        );
+        let errors = validate_name("Bad--Name-");
         assert!(errors.iter().any(|e| e.contains("invalid characters")));
         assert!(
             errors
@@ -3562,7 +3537,7 @@ mod tests {
         );
 
         let too_long = "a".repeat(MAX_SKILL_NAME_LEN + 1);
-        let too_long_errors = validate_name(&too_long, &too_long);
+        let too_long_errors = validate_name(&too_long);
         assert!(
             too_long_errors
                 .iter()
@@ -3582,18 +3557,6 @@ mod tests {
         ))));
 
         assert!(validate_description("ok").is_empty());
-    }
-
-    #[test]
-    fn test_validate_frontmatter_fields_allows_known_and_rejects_unknown() {
-        let keys = [
-            "name".to_string(),
-            "description".to_string(),
-            "unknown-field".to_string(),
-        ];
-        let errors = validate_frontmatter_fields(keys.iter());
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0], "unknown frontmatter field \"unknown-field\"");
     }
 
     #[test]
@@ -3632,7 +3595,6 @@ mod tests {
             Some("true"),
             "the key after the block still parses"
         );
-        assert!(validate_frontmatter_fields(parsed.frontmatter.keys()).is_empty());
         assert_eq!(parsed.body, "body");
     }
 
@@ -4299,13 +4261,13 @@ still frontmatter",
 
     #[test]
     fn test_validate_name_valid_name() {
-        let errors = validate_name("good-name", "good-name");
+        let errors = validate_name("good-name");
         assert!(errors.is_empty());
     }
 
     #[test]
     fn test_validate_name_single_char() {
-        let errors = validate_name("a", "a");
+        let errors = validate_name("a");
         assert!(errors.is_empty());
     }
 
@@ -4506,7 +4468,7 @@ still frontmatter",
         fs::create_dir_all(&skill_dir).expect("mkdir");
         fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: my-skill\ndescription: Alias diagnostic guard test\ninvalid-field: nope\n---\nBody",
+            "---\nname: My-Skill\ndescription: Alias diagnostic guard test\n---\nBody",
         )
         .expect("write skill");
 
@@ -4520,13 +4482,13 @@ still frontmatter",
         });
 
         assert_eq!(result.skills.len(), 1);
-        assert_eq!(result.skills[0].name, "my-skill");
+        assert_eq!(result.skills[0].name, "My-Skill");
         assert_eq!(result.diagnostics.len(), 1);
         assert_eq!(result.diagnostics[0].path, skill_dir.join("SKILL.md"));
         assert!(
             result.diagnostics[0]
                 .message
-                .contains("unknown frontmatter field")
+                .contains("invalid characters")
         );
     }
 
@@ -4614,7 +4576,7 @@ still frontmatter",
         proptest! {
             #[test]
             fn validate_name_accepts_valid_names(name in arb_valid_name()) {
-                let errors = validate_name(&name, &name);
+                let errors = validate_name(&name);
                 assert!(
                     errors.is_empty(),
                     "valid name '{name}' should have no errors, got: {errors:?}"
@@ -4628,7 +4590,7 @@ still frontmatter",
                 suffix in "[a-z]{1,5}",
             ) {
                 let name = format!("{prefix}{upper}{suffix}");
-                let errors = validate_name(&name, &name);
+                let errors = validate_name(&name);
                 assert!(
                     errors.iter().any(|e| e.contains("invalid characters")),
                     "uppercase in '{name}' should be rejected, got: {errors:?}"
@@ -4645,7 +4607,7 @@ still frontmatter",
                 } else {
                     format!("{core}-")
                 };
-                let errors = validate_name(&name, &name);
+                let errors = validate_name(&name);
                 assert!(
                     errors.iter().any(|e| e.contains("must not start or end with a hyphen")),
                     "name '{name}' should fail hyphen check, got: {errors:?}"
@@ -4658,7 +4620,7 @@ still frontmatter",
                 right in "[a-z]{1,8}",
             ) {
                 let name = format!("{left}--{right}");
-                let errors = validate_name(&name, &name);
+                let errors = validate_name(&name);
                 assert!(
                     errors.iter().any(|e| e.contains("consecutive hyphens")),
                     "name '{name}' should fail consecutive-hyphen check, got: {errors:?}"
@@ -4668,7 +4630,7 @@ still frontmatter",
             #[test]
             fn validate_name_length_limit_enforced(extra_len in 1..100usize) {
                 let name: String = "a".repeat(MAX_SKILL_NAME_LEN + extra_len);
-                let errors = validate_name(&name, &name);
+                let errors = validate_name(&name);
                 assert!(
                     errors.iter().any(|e| e.contains("exceeds")),
                     "name of length {} should exceed limit, got: {errors:?}",

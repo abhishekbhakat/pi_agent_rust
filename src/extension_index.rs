@@ -579,7 +579,7 @@ fn registration_categories_from_inclusion_entry(entry: &InclusionEntry) -> Vec<S
             "registerEvent" | "registerEventHook" => {
                 categories.insert("event_hook".to_string());
             }
-            "registerMessageRenderer" => {
+            "registerMessageRenderer" | "registerEntryRenderer" => {
                 categories.insert("ui_component".to_string());
             }
             "registerFlag" | "registerShortcut" => {

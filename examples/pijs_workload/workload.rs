@@ -1,6 +1,7 @@
-//! `PiJS` workload harness for deterministic perf baselines.
-#![recursion_limit = "256"]
-#![forbid(unsafe_code)]
+//! `PiJS` workload harness for deterministic perf baselines. Compiled as a
+//! module behind two thin crate roots: the `pijs_workload` example
+//! (examples/pijs_workload/main.rs) and the `pijs_workload` bench target
+//! (benches/pijs_workload.rs), which share this single implementation.
 
 use clap::{Parser, ValueEnum};
 use futures::executor::block_on;
@@ -299,7 +300,7 @@ impl NativeBenchRuntime {
     }
 }
 
-fn main() {
+pub fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
         std::process::exit(1);

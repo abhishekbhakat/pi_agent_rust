@@ -38,14 +38,44 @@ pub struct ManagedSkillInfo {
     pub managed: bool,
 }
 
+/// Frontmatter fields a managed-skill draft may carry. The skills loader
+/// itself accepts any field (TS pi parity: unknown frontmatter is silently
+/// ignored); this whitelist only guards agent-authored drafts written by
+/// `manage_skill`, keeping them to the managed-skill schema.
+const ALLOWED_MANAGED_SKILL_FIELDS: [&str; 8] = [
+    "name",
+    "description",
+    "license",
+    "compatibility",
+    "metadata",
+    "allowed-tools",
+    "disable-model-invocation",
+    "managed",
+];
+
+fn validate_frontmatter_fields<'a, I>(keys: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let allowed: std::collections::HashSet<&str> =
+        ALLOWED_MANAGED_SKILL_FIELDS.into_iter().collect();
+    let mut errors = Vec::new();
+    for key in keys {
+        if !allowed.contains(key.as_str()) {
+            errors.push(format!("unknown frontmatter field \"{key}\""));
+        }
+    }
+    errors
+}
+
 /// Lint a skill draft with the same validators the skills loader applies.
 /// Returns the list of violations (empty = valid).
 #[must_use]
 pub fn lint_skill_draft(name: &str, description: &str, fields: &[&str]) -> Vec<String> {
-    let mut errors = crate::resources::validate_name(name, name);
+    let mut errors = crate::resources::validate_name(name);
     errors.extend(crate::resources::validate_description(description));
     let owned: Vec<String> = fields.iter().map(|field| (*field).to_string()).collect();
-    errors.extend(crate::resources::validate_frontmatter_fields(owned.iter()));
+    errors.extend(validate_frontmatter_fields(owned.iter()));
     errors
 }
 

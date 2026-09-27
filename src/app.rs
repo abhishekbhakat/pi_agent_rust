@@ -1487,6 +1487,21 @@ pub fn resolve_model_scope(
     registry: &ModelRegistry,
     allow_missing_keys: bool,
 ) -> Vec<ScopedModel> {
+    resolve_model_scope_with_warnings(patterns, registry, allow_missing_keys, true)
+}
+
+/// Resolve enabled-models scope, optionally suppressing per-pattern warnings.
+///
+/// The CLI resolves the scope once before extensions load and again after
+/// extension-registered providers are merged. The early pass stays quiet when
+/// extensions are pending so each pattern warns exactly once (post-merge),
+/// matching the TS coding agent's single resolution pass.
+pub fn resolve_model_scope_with_warnings(
+    patterns: &[String],
+    registry: &ModelRegistry,
+    allow_missing_keys: bool,
+    warn: bool,
+) -> Vec<ScopedModel> {
     let available_models = if allow_missing_keys {
         registry.models().to_vec()
     } else {
@@ -1534,14 +1549,18 @@ pub fn resolve_model_scope(
             }
 
             if !matched_any {
-                eprintln!("Warning: No models match pattern \"{pattern}\"");
+                if warn {
+                    eprintln!("Warning: No models match pattern \"{pattern}\"");
+                }
             }
             continue;
         }
 
         let parsed = parse_model_pattern(pattern, &available_models);
         if let Some(warning) = parsed.warning {
-            eprintln!("Warning: {warning}");
+            if warn {
+                eprintln!("Warning: {warning}");
+            }
         }
 
         if let Some(model) = parsed.model {
@@ -1554,7 +1573,7 @@ pub fn resolve_model_scope(
                     thinking_level: parsed.thinking_level,
                 });
             }
-        } else {
+        } else if warn {
             eprintln!("Warning: No models match pattern \"{pattern}\"");
         }
     }

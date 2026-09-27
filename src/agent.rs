@@ -60,7 +60,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6343,16 +6343,47 @@ impl ExtensionHostActions for AgentSessionHostActions {
 
     async fn complete_ai(&self, request: ExtensionAiCompletionRequest) -> Result<Value> {
         let _provider_admission = self.acquire_provider_admission().await?;
-        let (provider, mut stream_options) = {
+        let (session_provider, mut stream_options) = {
             let state = self.ai_completion.lock().map_err(|_| {
                 Error::extension("extension completion host state mutex poisoned".to_string())
             })?;
             (Arc::clone(&state.provider), state.stream_options.clone())
         };
+        // pi-ai parity: the request carries its own credentials
+        // (`options.apiKey`) and per-request headers. Honor both.
+        if let Some(key) = request
+            .options
+            .get("apiKey")
+            .or_else(|| request.options.get("api_key"))
+            .and_then(serde_json::Value::as_str)
+            && !key.trim().is_empty()
+        {
+            stream_options.api_key = Some(key.to_string());
+        }
+        if let Some(headers) = request.options.get("headers").and_then(|v| v.as_object()) {
+            for (name, value) in headers {
+                if let Some(value) = value.as_str() {
+                    stream_options.headers.insert(name.clone(), value.to_string());
+                }
+            }
+        }
+        // When the request model names a wire api, build a NATIVE transport
+        // provider from the model spec instead of reusing the session
+        // provider. The session provider may be an extension-registered
+        // streamSimple provider whose JS is currently blocked awaiting this
+        // very hostcall; calling back into it deadlocks the runtime. The
+        // extension has already resolved routing/auth (baseUrl + apiKey in
+        // the payload), so the native transport can service the request
+        // directly (gh #167).
+        let provider: Arc<dyn Provider> =
+            match pi_ai_request_model_entry(&request.model) {
+                Some(entry) => crate::providers::create_provider(&entry, None)?,
+                None => session_provider,
+            };
+        let provider_name = provider.name().to_string();
 
         apply_pi_ai_completion_options(&request.options, &mut stream_options)?;
         let context = build_pi_ai_completion_context(&request)?;
-        let provider_name = provider.name().to_string();
         let mut events = provider.stream(&context, &stream_options).await?;
         let mut streamed_text = String::new();
 
@@ -6696,6 +6727,95 @@ fn pi_ai_model_registry_values(registry: &ModelRegistry) -> Vec<Value> {
         .iter()
         .map(pi_ai_model_entry_value)
         .collect()
+}
+
+/// Build a native-transport [`ModelEntry`] from a pi-ai completion request's
+/// model payload. Returns `None` when the model does not name a wire `api`
+/// (callers then fall back to the session provider). Used by
+/// [`ExtensionHostActions::complete_ai`] so extension-registered
+/// `streamSimple` providers never re-enter the JS runtime (gh #167): the
+/// extension resolves routing/auth itself and the host services the HTTP
+/// with its own transport for the declared api.
+fn pi_ai_request_model_entry(model: &Value) -> Option<ModelEntry> {
+    let api = model.get("api")?.as_str()?.trim().to_string();
+    if api.is_empty() {
+        return None;
+    }
+    let id = model
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let name = model
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| id.clone());
+    let provider = model
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| "extension".to_string());
+    let base_url = model
+        .get("baseUrl")
+        .or_else(|| model.get("base_url"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let reasoning = model
+        .get("reasoning")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let context_window = model
+        .get("contextWindow")
+        .or_else(|| model.get("context_window"))
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(128_000);
+    let max_tokens = model
+        .get("maxTokens")
+        .or_else(|| model.get("max_tokens"))
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0);
+    let mut headers = HashMap::new();
+    if let Some(model_headers) = model.get("headers").and_then(Value::as_object) {
+        for (key, value) in model_headers {
+            if let Some(value) = value.as_str() {
+                headers.insert(key.clone(), value.to_string());
+            }
+        }
+    }
+    Some(ModelEntry {
+        model: crate::provider::Model {
+            id,
+            name,
+            api,
+            provider,
+            base_url,
+            reasoning,
+            input: Vec::new(),
+            cost: crate::provider::ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window,
+            max_tokens,
+            headers,
+        },
+        api_key: None,
+        headers: HashMap::new(),
+        auth_header: true,
+        compat: None,
+        oauth_config: None,
+    })
 }
 
 fn apply_pi_ai_completion_options(
@@ -12641,6 +12761,38 @@ mod finish_turn_persistence_tests {
     }
 }
 
+/// Normalized `systemPromptOptions` for `before_agent_start` extension
+/// events (gh #167), parity with TS pi's `NormalizedBuildSystemPromptOptions`.
+/// The Rust host renders its system prompt as a flat string, so sections and
+/// tool snippets stay empty; skills, cwd, and selectedTools are the fields
+/// extensions consume.
+pub fn extension_system_prompt_options(
+    skills: &[crate::resources::Skill],
+    cwd: &std::path::Path,
+    enabled_tools: &[&str],
+) -> Value {
+    json!({
+        "selectedTools": enabled_tools,
+        "toolSnippets": {},
+        "toolGuidelines": {},
+        "promptGuidelines": [],
+        "appendSystemPrompt": "",
+        "sections": {},
+        "cwd": cwd.display().to_string(),
+        "contextFiles": [],
+        "skills": skills
+            .iter()
+            .map(crate::resources::Skill::to_extension_value)
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Fallback `systemPromptOptions` when the host never seeded the real ones:
+/// the normalized empty shape TS pi extensions expect (never `undefined`).
+fn empty_extension_system_prompt_options() -> Value {
+    extension_system_prompt_options(&[], std::path::Path::new(""), &[])
+}
+
 impl AgentSession {
     fn job_session_id_resolver(session: &Arc<Mutex<Session>>) -> crate::jobs::JobSessionIdResolver {
         let job_session = Arc::clone(session);
@@ -15162,6 +15314,21 @@ impl AgentSession {
             Some(self.agent.provider().model_id().to_string()),
         );
         manager.set_system_prompt(self.agent.system_prompt().map(ToString::to_string));
+        // gh #167 parity: seed builtin tool definitions so `pi.getAllTools()`
+        // answers synchronously (TS pi returns ToolInfo[] with no hostcall).
+        let builtin_tool_defs = tools
+            .snapshot()
+            .tools()
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name(),
+                    "description": tool.description(),
+                    "parameters": tool.parameters(),
+                })
+            })
+            .collect::<Vec<_>>();
+        manager.set_builtin_tool_defs(builtin_tool_defs);
 
         let injected = Arc::new(StdMutex::new(ExtensionInjectedQueue::new(
             steering_mode,
@@ -15609,10 +15776,15 @@ impl AgentSession {
         };
 
         let images_value = serde_json::to_value(images).unwrap_or(Value::Null);
+        let system_prompt_options = region
+            .manager()
+            .system_prompt_options()
+            .unwrap_or_else(empty_extension_system_prompt_options);
         let payload = json!({
             "prompt": prompt,
             "images": images_value,
             "systemPrompt": system_prompt,
+            "systemPromptOptions": system_prompt_options,
         });
 
         let response = region

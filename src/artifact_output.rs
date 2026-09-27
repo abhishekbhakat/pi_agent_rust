@@ -421,7 +421,12 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         let target = resolve_new(root.path(), "result.bin", "test").unwrap();
-        rustix::fs::mkfifoat(rustix::fs::CWD, target.path(), Mode::RUSR | Mode::WUSR).unwrap();
+        // rustix omits mkfifoat on Apple targets; the mkfifo(1) binary is portable.
+        let status = std::process::Command::new("mkfifo")
+            .arg(target.path())
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo must create the test fixture");
         let worker_target = target.clone();
         let (send, receive) = mpsc::channel();
         let worker = std::thread::spawn(move || {

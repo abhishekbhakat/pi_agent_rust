@@ -97,6 +97,13 @@ pub struct ModelEntry {
     pub oauth_config: Option<OAuthConfig>,
 }
 
+/// Catalog `thinkingLevelMap`: pi thinking-level name -> provider value.
+///
+/// A missing key falls back to the transport's built-in mapping. A `null`
+/// value (legacy TypeScript pi catalogs) marks the level as unsupported for
+/// the model: it is hidden from the level list and clamped away.
+pub type ThinkingLevelMap = HashMap<String, Option<String>>;
+
 impl ModelEntry {
     /// Explicit tool-call dialect selected by the catalog. Absence is
     /// fail-closed Native behavior; model-name heuristics are informational
@@ -174,7 +181,16 @@ impl ModelEntry {
         self.compat
             .as_ref()
             .and_then(|compat| compat.thinking_level_map.as_ref())
-            .is_some_and(|map| map.contains_key(level))
+            .is_some_and(|map| matches!(map.get(level), Some(Some(_))))
+    }
+
+    /// Whether the catalog's `thinkingLevelMap` marks the level unsupported
+    /// with an explicit `null` (legacy TypeScript pi catalogs).
+    fn thinking_level_map_disables(&self, level: crate::model::ThinkingLevel) -> bool {
+        self.compat
+            .as_ref()
+            .and_then(|compat| compat.thinking_level_map.as_ref())
+            .is_some_and(|map| matches!(map.get(level.to_string().as_str()), Some(None)))
     }
 
     /// Whether this is an Anthropic adaptive-thinking model whose modern
@@ -327,6 +343,7 @@ impl ModelEntry {
         if self.supports_max() {
             levels.push(ThinkingLevel::Max);
         }
+        levels.retain(|level| !self.thinking_level_map_disables(*level));
         levels
     }
 
@@ -334,8 +351,10 @@ impl ModelEntry {
     ///
     /// Non-reasoning models always return `Off`. Models without max support
     /// downgrade `Max` to `XHigh` (or `High` if xhigh is also unsupported);
-    /// models without xhigh support downgrade `XHigh` to `High`. All other
-    /// levels pass through unchanged.
+    /// models without xhigh support downgrade `XHigh` to `High`. A level the
+    /// catalog disables with a `null` `thinkingLevelMap` entry moves to the
+    /// nearest supported level above it, else below. All other levels pass
+    /// through unchanged.
     pub fn clamp_thinking_level(
         &self,
         thinking: crate::model::ThinkingLevel,
@@ -352,9 +371,30 @@ impl ModelEntry {
             };
         }
         if thinking == crate::model::ThinkingLevel::XHigh && !self.supports_xhigh() {
-            return crate::model::ThinkingLevel::High;
+            thinking = crate::model::ThinkingLevel::High;
         }
-        thinking
+        if !self.thinking_level_map_disables(thinking) {
+            return thinking;
+        }
+        // Level disabled by a `null` catalog entry: take the nearest supported
+        // level above it, else the nearest below (TypeScript pi semantics).
+        let available = self.available_thinking_levels();
+        let order = [
+            crate::model::ThinkingLevel::Off,
+            crate::model::ThinkingLevel::Minimal,
+            crate::model::ThinkingLevel::Low,
+            crate::model::ThinkingLevel::Medium,
+            crate::model::ThinkingLevel::High,
+            crate::model::ThinkingLevel::XHigh,
+            crate::model::ThinkingLevel::Max,
+        ];
+        let idx = order.iter().position(|l| *l == thinking).unwrap_or(0);
+        order[idx..]
+            .iter()
+            .chain(order[..idx].iter().rev())
+            .find(|l| available.contains(l))
+            .copied()
+            .unwrap_or(crate::model::ThinkingLevel::Off)
     }
 }
 
@@ -957,7 +997,7 @@ pub struct ModelOverrideConfig {
     pub headers: Option<HashMap<String, String>>,
     pub compat: Option<CompatConfig>,
     pub dialect: Option<crate::dialects::Dialect>,
-    pub thinking_level_map: Option<HashMap<String, String>>,
+    pub thinking_level_map: Option<ThinkingLevelMap>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -980,7 +1020,7 @@ pub struct ModelConfig {
     /// folded into the entry's merged [`CompatConfig`] at registry build time.
     /// Declaring a mapping for `xhigh`/`max` also marks the level as supported,
     /// so the registry does not clamp it away for custom models.
-    pub thinking_level_map: Option<HashMap<String, String>>,
+    pub thinking_level_map: Option<ThinkingLevelMap>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1024,7 +1064,7 @@ pub struct CompatConfig {
     /// (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).
     /// Lets the catalog steer a transport's effort serialization without code
     /// changes (gh #117). When absent, transports apply their built-in mapping.
-    pub thinking_level_map: Option<HashMap<String, String>>,
+    pub thinking_level_map: Option<ThinkingLevelMap>,
     /// Force the modern adaptive-thinking API (`thinking: {type: "adaptive"}`
     /// plus `output_config.effort`) instead of the deprecated `budget_tokens`
     /// extended-thinking path. Authoritative over a transport's built-in
@@ -1714,6 +1754,28 @@ impl ModelRegistry {
             let manual_provider_headers = manual_config
                 .as_ref()
                 .map(|config| resolve_provider_headers_snapshot(config, path.parent()));
+
+            // TypeScript pi's dynamic provider catalog (models-store.json)
+            // overlays the built-in catalogs before generated and manual
+            // configuration apply, so both can still override it.
+            let store_path = models_store_path(&path);
+            match fs::symlink_metadata(&store_path) {
+                Ok(_) => match load_models_store_catalog(&store_path) {
+                    Ok(Some(catalog)) => apply_models_store(
+                        &stable_resolve_api_key,
+                        &mut models,
+                        &catalog,
+                        path.parent(),
+                    ),
+                    Ok(None) => {}
+                    Err(error) => errors.push(format!("{error}")),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => errors.push(format!(
+                    "Failed to inspect dynamic model catalog {}: {error}",
+                    store_path.display()
+                )),
+            }
 
             match fs::symlink_metadata(&fetched_path) {
                 Ok(_) if manual_config_load_failed => errors.push(format!(
@@ -4003,6 +4065,122 @@ pub fn default_models_path(agent_dir: &Path) -> PathBuf {
 /// merged or rewritten on disk.
 pub fn fetched_models_path(models_path: &Path) -> PathBuf {
     models_path.with_file_name("models.fetched.json")
+}
+
+/// Location of the TypeScript pi dynamic provider catalog
+/// (`~/.pi/agent/models-store.json`, sibling of `models.json`).
+pub fn models_store_path(models_path: &Path) -> PathBuf {
+    models_path.with_file_name("models-store.json")
+}
+
+/// One provider entry in the TypeScript pi `models-store.json` catalog.
+/// `checkedAt`/`lastModified`/`etag` freshness metadata is ignored here.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelsStoreEntry {
+    #[serde(default)]
+    models: Vec<ModelsStoreModel>,
+}
+
+/// A `models-store.json` model row: the full model configuration plus the
+/// per-model `baseUrl` that the store carries alongside it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelsStoreModel {
+    #[serde(flatten)]
+    config: ModelConfig,
+    #[serde(default)]
+    base_url: Option<String>,
+}
+
+type ModelsStoreCatalog = HashMap<String, ModelsStoreEntry>;
+
+/// Parse the TypeScript pi `models-store.json` dynamic catalog.
+/// Returns `None` when the file exists but contains no providers.
+fn load_models_store_catalog(
+    path: &Path,
+) -> std::result::Result<Option<ModelsStoreCatalog>, Error> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| Error::config(format!("Failed to read {}: {error}", path.display())))?;
+    let catalog: ModelsStoreCatalog = serde_json::from_str(&contents)
+        .map_err(|error| Error::config(format!("Invalid model store {}: {error}", path.display())))?;
+    if catalog.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(catalog))
+}
+
+/// Overlay the dynamic store catalog onto the registry with upstream pi's
+/// merge semantics (`mergeModels` in remote-catalog-provider): a stored model
+/// replaces the registry entry with the same id, store-only models are
+/// appended, and registry models the store does not list are kept.
+fn apply_models_store(
+    auth: &impl ModelCredentialResolver,
+    models: &mut Vec<ModelEntry>,
+    catalog: &ModelsStoreCatalog,
+    base_dir: Option<&Path>,
+) {
+    let mut config = ModelsConfig {
+        providers: HashMap::new(),
+    };
+    let mut kept_by_provider: Vec<(String, Vec<ModelEntry>)> = Vec::new();
+
+    for (provider_id, entry) in catalog {
+        if entry.models.is_empty() {
+            // An empty stored catalog keeps the registry as-is.
+            continue;
+        }
+        let canonical = canonical_provider_key(provider_id);
+        let store_ids: HashSet<String> = entry
+            .models
+            .iter()
+            .map(|model| model.config.id.to_lowercase())
+            .collect();
+        let kept: Vec<ModelEntry> = models
+            .iter()
+            .filter(|existing| {
+                canonical_provider_key(&existing.model.provider) == canonical
+                    && !store_ids.contains(&existing.model.id.to_lowercase())
+            })
+            .cloned()
+            .collect();
+        kept_by_provider.push((canonical, kept));
+        config.providers.insert(
+            provider_id.clone(),
+            ProviderConfig {
+                models: Some(
+                    entry
+                        .models
+                        .iter()
+                        .map(|model| model.config.clone())
+                        .collect(),
+                ),
+                base_url: entry
+                    .models
+                    .iter()
+                    .find_map(|model| model.base_url.clone()),
+                ..ProviderConfig::default()
+            },
+        );
+    }
+
+    if config.providers.is_empty() {
+        return;
+    }
+
+    apply_custom_models(auth, models, &config, base_dir);
+
+    for (canonical, kept) in kept_by_provider {
+        for entry in kept {
+            let already_present = models.iter().any(|existing| {
+                canonical_provider_key(&existing.model.provider) == canonical
+                    && existing.model.id.eq_ignore_ascii_case(&entry.model.id)
+            });
+            if !already_present {
+                models.push(entry);
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -8697,8 +8875,8 @@ mod tests {
         let mut entry = make_model_entry("my-custom-reasoner", true);
         entry.compat = Some(CompatConfig {
             thinking_level_map: Some(HashMap::from([
-                ("xhigh".to_string(), "high".to_string()),
-                ("max".to_string(), "ultra".to_string()),
+                ("xhigh".to_string(), Some("high".to_string())),
+                ("max".to_string(), Some("ultra".to_string())),
             ])),
             ..CompatConfig::default()
         });
@@ -8734,7 +8912,10 @@ mod tests {
         use crate::model::ThinkingLevel;
         let mut entry = make_model_entry("my-custom-reasoner", true);
         entry.compat = Some(CompatConfig {
-            thinking_level_map: Some(HashMap::from([("xhigh".to_string(), "max".to_string())])),
+            thinking_level_map: Some(HashMap::from([(
+                "xhigh".to_string(),
+                Some("max".to_string()),
+            )])),
             ..CompatConfig::default()
         });
         assert!(entry.supports_xhigh());
@@ -8749,6 +8930,81 @@ mod tests {
         assert_eq!(
             bare.clamp_thinking_level(ThinkingLevel::XHigh),
             ThinkingLevel::High
+        );
+    }
+
+    /// Legacy TypeScript pi catalogs mark unsupported levels with `null`; the
+    /// file must still load (model-level, compat and override maps alike).
+    #[test]
+    fn thinking_level_map_accepts_null_entries() {
+        let config = serde_json::from_str::<ModelsConfig>(
+            r#"{"providers":{"local":{
+                "compat":{"thinkingLevelMap":{"minimal":null}},
+                "models":[{"id":"glm","reasoning":true,
+                    "thinkingLevelMap":{"off":"off","minimal":null,"max":"max"}}],
+                "modelOverrides":{"glm":{"thinkingLevelMap":{"low":null}}}
+            }}}"#,
+        )
+        .expect("null thinkingLevelMap entries must parse");
+        let provider = &config.providers["local"];
+        let model_map = provider.models.as_ref().expect("models")[0]
+            .thinking_level_map
+            .as_ref()
+            .expect("model map");
+        assert_eq!(model_map.get("minimal"), Some(&None));
+        assert_eq!(model_map.get("max"), Some(&Some("max".to_string())));
+    }
+
+    #[test]
+    fn thinking_level_map_null_hides_and_clamps_levels() {
+        use crate::model::ThinkingLevel;
+        let mut entry = make_model_entry("my-custom-reasoner", true);
+        entry.compat = Some(CompatConfig {
+            thinking_level_map: Some(HashMap::from([
+                ("minimal".to_string(), None),
+                ("medium".to_string(), None),
+                ("xhigh".to_string(), None),
+                ("max".to_string(), Some("max".to_string())),
+            ])),
+            ..CompatConfig::default()
+        });
+        assert!(!entry.supports_xhigh(), "null must not declare xhigh");
+        assert!(entry.supports_max());
+        assert_eq!(
+            entry.available_thinking_levels(),
+            vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Low,
+                ThinkingLevel::High,
+                ThinkingLevel::Max
+            ]
+        );
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Minimal),
+            ThinkingLevel::Low
+        );
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Medium),
+            ThinkingLevel::High
+        );
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Max),
+            ThinkingLevel::Max
+        );
+
+        // Nothing supported above the disabled level: fall back below it.
+        let mut capped = make_model_entry("my-custom-reasoner", true);
+        capped.compat = Some(CompatConfig {
+            thinking_level_map: Some(HashMap::from([("high".to_string(), None)])),
+            ..CompatConfig::default()
+        });
+        assert_eq!(
+            capped.clamp_thinking_level(ThinkingLevel::High),
+            ThinkingLevel::Medium
+        );
+        assert_eq!(
+            capped.clamp_thinking_level(ThinkingLevel::XHigh),
+            ThinkingLevel::Medium
         );
     }
 
@@ -8841,13 +9097,13 @@ mod tests {
                         compat: Some(CompatConfig {
                             thinking_level_map: Some(HashMap::from([(
                                 "xhigh".to_string(),
-                                "compat-loses".to_string(),
+                                Some("compat-loses".to_string()),
                             )])),
                             ..CompatConfig::default()
                         }),
                         thinking_level_map: Some(HashMap::from([(
                             "xhigh".to_string(),
-                            "high".to_string(),
+                            Some("high".to_string()),
                         )])),
                         ..ModelConfig::default()
                     }]),
@@ -8867,7 +9123,7 @@ mod tests {
             .as_ref()
             .and_then(|compat| compat.thinking_level_map.as_ref())
             .expect("thinkingLevelMap should be carried on merged compat");
-        assert_eq!(map.get("xhigh").map(String::as_str), Some("high"));
+        assert_eq!(map.get("xhigh").and_then(Option::as_deref), Some("high"));
         assert!(
             entry.supports_xhigh(),
             "declared xhigh mapping must survive clamping"

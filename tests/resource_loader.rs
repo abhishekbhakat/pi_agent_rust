@@ -129,8 +129,8 @@ fn load_skills_defaults_and_collision_diagnostics() {
 }
 
 #[test]
-fn load_skills_reports_unknown_frontmatter_fields() {
-    let harness = TestHarness::new("load_skills_reports_unknown_frontmatter_fields");
+fn load_skills_ignores_unknown_frontmatter_fields() {
+    let harness = TestHarness::new("load_skills_ignores_unknown_frontmatter_fields");
 
     let cwd = harness.temp_path("project");
     std::fs::create_dir_all(&cwd).expect("create cwd");
@@ -172,11 +172,9 @@ fn load_skills_reports_unknown_frontmatter_fields() {
     assert_eq!(skill.source, "user");
 
     assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|d| d.message == "unknown frontmatter field \"bogus\""),
-        "expected unknown-field warning"
+        result.diagnostics.is_empty(),
+        "TS pi parity: unknown frontmatter fields are silently ignored; got: {:?}",
+        result.diagnostics
     );
 }
 

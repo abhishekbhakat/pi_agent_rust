@@ -470,7 +470,6 @@ mod tests {
     #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
     #[test]
     fn completed_file_rejects_symlink_and_fifo_leaves() {
-        use rustix::fs::Mode;
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -478,12 +477,12 @@ mod tests {
         std::fs::write(&secret, b"secret").unwrap();
         symlink(&secret, dir.path().join("linked")).unwrap();
         assert!(read_completed(dir.path(), &completed_record("linked", 6.0)).is_err());
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            dir.path().join("fifo"),
-            Mode::RUSR | Mode::WUSR,
-        )
-        .unwrap();
+        // rustix omits mkfifoat on Apple targets; the mkfifo(1) binary is portable.
+        let status = std::process::Command::new("mkfifo")
+            .arg(dir.path().join("fifo"))
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo must create the test fixture");
         assert!(read_completed(dir.path(), &completed_record("fifo", 0.0)).is_err());
     }
 }
